@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Entry point: symlink this file onto PATH. Resolves symlinks to find cm_sync.py next to it.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+exec python3 -I "$(cd -P "$(dirname "$src")" && pwd)/cm_sync.py" "$@"

@@ -1,0 +1,298 @@
+import json
+import sqlite3
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from unittest import mock
+
+import cm_sync as cm
+
+SCHEMA = """
+CREATE TABLE sdk_sessions (id INTEGER PRIMARY KEY, content_session_id TEXT NOT NULL, memory_session_id TEXT UNIQUE,
+  project TEXT NOT NULL, platform_source TEXT NOT NULL DEFAULT 'claude', user_prompt TEXT, custom_title TEXT,
+  started_at TEXT NOT NULL, started_at_epoch INTEGER NOT NULL, completed_at TEXT, completed_at_epoch INTEGER,
+  status TEXT NOT NULL DEFAULT 'active');
+CREATE TABLE observations (id INTEGER PRIMARY KEY, memory_session_id TEXT NOT NULL, project TEXT NOT NULL, text TEXT,
+  type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, concepts TEXT, files_read TEXT,
+  files_modified TEXT, prompt_number INTEGER, created_at TEXT NOT NULL, created_at_epoch INTEGER NOT NULL,
+  discovery_tokens INTEGER DEFAULT 0, merged_into_project TEXT, agent_type TEXT, agent_id TEXT, metadata TEXT);
+CREATE TABLE session_summaries (id INTEGER PRIMARY KEY, memory_session_id TEXT NOT NULL, project TEXT NOT NULL,
+  request TEXT, investigated TEXT, learned TEXT, completed TEXT, next_steps TEXT, files_read TEXT, files_edited TEXT,
+  notes TEXT, prompt_number INTEGER, created_at TEXT NOT NULL, created_at_epoch INTEGER NOT NULL,
+  discovery_tokens INTEGER DEFAULT 0, merged_into_project TEXT);
+CREATE TABLE user_prompts (id INTEGER PRIMARY KEY, session_db_id INTEGER, content_session_id TEXT NOT NULL,
+  prompt_number INTEGER NOT NULL, prompt_text TEXT NOT NULL, created_at TEXT NOT NULL, created_at_epoch INTEGER NOT NULL);
+"""
+
+
+class FakeWorker(BaseHTTPRequestHandler):
+    requests = []
+
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self.requests.append(("GET", self.path, None))
+        self._reply(200, {"status": "ok", "version": "test"})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.requests.append(("POST", self.path, body))
+        stats = {f"{k}Imported": len(body.get(k, [])) for k in ("sessions", "summaries", "observations", "prompts")}
+        self._reply(200, {"stats": stats, "rejected": {}})
+
+    def do_DELETE(self):
+        self.requests.append(("DELETE", self.path, None))
+        self._reply(200, {"ok": True})
+
+
+class Env:
+    """A device: its own database, state dir and settings, sharing one repo."""
+
+    def __init__(self, root, name, repo, worker_url):
+        self.dir = root / name
+        self.dir.mkdir(parents=True)
+        self.db = self.dir / "claude-mem.db"
+        con = sqlite3.connect(self.db)
+        con.executescript(SCHEMA)
+        con.commit()
+        con.close()
+        (self.dir / "settings.json").write_text(json.dumps({"CLAUDE_MEM_REDACT_ENABLED": "true"}))
+        self.repo = repo
+        self.worker_url = worker_url
+        self.state_dir = self.dir / "state"
+        self.cfg = None
+        self.reload()
+        self.state.create_device(name)
+
+    def reload(self):
+        cfg = cm.Config(self.repo, self.state_dir)
+        cfg.data_dir, cfg.db_path, cfg.settings_path = self.dir, self.db, self.dir / "settings.json"
+        cfg.settings = json.loads(cfg.settings_path.read_text())
+        cfg.worker_url = self.worker_url
+        self.cfg = cfg
+        self.state = cm.State(cfg)
+        self.worker = cm.Worker(self.worker_url)
+
+    def sql(self, statement, *params):
+        con = sqlite3.connect(self.db)
+        cur = con.execute(statement, params)
+        con.commit()
+        con.close()
+        return cur.lastrowid
+
+    def add_session(self, sid="s1", prompt="first prompt"):
+        return self.sql(
+            "INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, platform_source, user_prompt, started_at, started_at_epoch) "
+            "VALUES (?, ?, 'GR', 'claude', ?, '2026-10-20', 1)", sid, "mem-" + sid, prompt)
+
+    def add_observation(self, title, sid="s1", epoch=100, type_="discovery", narrative="n", metadata=None):
+        return self.sql(
+            "INSERT INTO observations (memory_session_id, project, type, title, narrative, facts, created_at, created_at_epoch, metadata) "
+            "VALUES (?, 'GR', ?, ?, ?, '[]', '2026-10-20', ?, ?)", "mem-" + sid, type_, title, narrative, epoch, metadata)
+
+    def export(self, **kw):
+        return cm.export(self.cfg, self.state, None, **kw)
+
+    def device_dir(self):
+        return cm.device_dir(self.cfg, self.state.device["id"])
+
+
+class CmSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        FakeWorker.requests = []
+        self.server = HTTPServer(("127.0.0.1", 0), FakeWorker)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{self.server.server_port}"
+        cm.QUIET = True
+        self.a = Env(self.root, "a", self.repo, url)
+        self.b = Env(self.root, "b", self.repo, url)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def rows(self, env, kind):
+        return cm.read_jsonl(env.device_dir() / f"{kind}.jsonl")
+
+    def test_key_ignores_non_dedup_columns(self):
+        row = {"memory_session_id": "m", "type": "discovery", "title": "t", "created_at_epoch": 1, "discovery_tokens": 5}
+        self.assertEqual(cm.row_key("observations", row), cm.row_key("observations", dict(row, discovery_tokens=99, project="x")))
+        self.assertNotEqual(cm.row_key("observations", row), cm.row_key("observations", dict(row, title="other")))
+
+    def test_export_is_deterministic(self):
+        self.a.add_session()
+        self.a.add_observation("one", epoch=2)
+        self.a.add_observation("two", epoch=1)
+        self.a.export()
+        first = {p.name: p.read_bytes() for p in self.a.device_dir().iterdir()}
+        self.a.export()
+        self.assertEqual(first, {p.name: p.read_bytes() for p in self.a.device_dir().iterdir()})
+        self.assertEqual([r["title"] for r in self.rows(self.a, "observations")], ["two", "one"])
+
+    def test_imported_rows_are_not_exported_again(self):
+        self.a.add_session()
+        self.a.add_observation("from a")
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        # simulate the worker having inserted A's rows into B's database
+        self.b.add_session()
+        self.b.add_observation("from a")
+        self.b.add_observation("from b", epoch=200)
+        self.b.export()
+        self.assertEqual([r["title"] for r in self.rows(self.b, "observations")], ["from b"])
+
+    def test_deleted_row_becomes_tombstone(self):
+        self.a.add_session()
+        obs = self.a.add_observation("doomed")
+        self.a.export()
+        self.a.sql("DELETE FROM observations WHERE id = ?", obs)
+        result = self.a.export()
+        self.assertEqual(result["tombstones"], 1)
+        tombstones = cm.read_jsonl(self.a.device_dir() / "tombstones.jsonl")
+        self.assertEqual([t["kind"] for t in tombstones], ["observations"])
+        self.assertEqual(self.rows(self.a, "observations"), [])
+        self.a.export()
+        self.assertEqual(len(cm.read_jsonl(self.a.device_dir() / "tombstones.jsonl")), 1)
+
+    def test_import_skips_tombstoned_rows_and_deletes_local_copy(self):
+        self.a.add_session()
+        obs = self.a.add_observation("doomed")
+        self.a.export()
+        # B already has A's row from an earlier import
+        self.b.add_session()
+        b_obs = self.b.add_observation("doomed")
+        self.a.sql("DELETE FROM observations WHERE id = ?", obs)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        posts = [r for r in FakeWorker.requests if r[0] == "POST"]
+        self.assertEqual(posts, [])
+        self.assertIn(("DELETE", f"/api/observation/{b_obs}", None), FakeWorker.requests)
+        FakeWorker.requests.clear()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertNotIn("DELETE", [r[0] for r in FakeWorker.requests])
+
+    def test_batches_respect_limit_and_carry_sessions(self):
+        sessions = [(cm.row_key("sessions", s), s) for s in (
+            {"content_session_id": "c1", "memory_session_id": "m1", "platform_source": "claude"},
+            {"content_session_id": "c2", "memory_session_id": "m2", "platform_source": "claude"},
+        )]
+        rows = {"observations": [(f"k{i}", {"memory_session_id": "m1" if i < 5 else "m2", "narrative": "x" * 400}) for i in range(10)]}
+        result = list(cm.batches(rows, sessions, limit=1500))
+        self.assertGreater(len(result), 1)
+        for payload, keys in result:
+            self.assertLessEqual(len(json.dumps(payload)), 1500 + 600)
+            ids = {s["memory_session_id"] for s in payload["sessions"]}
+            self.assertTrue(all(o["memory_session_id"] in ids for o in payload["observations"]))
+            self.assertEqual(len(keys["observations"]), len(payload["observations"]))
+        self.assertEqual(sum(len(p["observations"]) for p, _ in result), 10)
+
+    def test_sensitive_and_prompts_excluded_by_default(self):
+        sid = self.a.add_session(prompt="secret first prompt")
+        self.a.add_observation("public")
+        self.a.add_observation("hidden", type_="sensitive", epoch=101)
+        self.a.add_observation("from md", epoch=102, metadata='{"source":"memory-file"}')
+        self.a.sql("INSERT INTO user_prompts (session_db_id, content_session_id, prompt_number, prompt_text, created_at, created_at_epoch) "
+                   "VALUES (?, 's1', 1, 'hello', '2026-10-20', 1)", sid)
+        self.a.export()
+        self.assertEqual([r["title"] for r in self.rows(self.a, "observations")], ["public"])
+        self.assertIsNone(self.rows(self.a, "sessions")[0]["user_prompt"])
+        self.assertFalse((self.a.device_dir() / "prompts.jsonl").exists())
+        self.a.export(with_prompts=True)
+        self.assertEqual([r["prompt_text"] for r in self.rows(self.a, "prompts")], ["hello"])
+        self.assertEqual(self.rows(self.a, "sessions")[0]["user_prompt"], "secret first prompt")
+
+    def test_secret_scan_aborts_without_writing_or_leaking(self):
+        token = "ghp_" + "A1b2C3d4" * 5
+        self.a.add_session()
+        self.a.add_observation("leak", narrative=f"the token is {token}")
+        with self.assertRaises(cm.CmSyncError) as ctx:
+            self.a.export()
+        self.assertIn("github-token", str(ctx.exception))
+        self.assertNotIn(token, str(ctx.exception))
+        self.assertFalse(self.a.device_dir().exists())
+        self.a.export(exclude_flagged=True)
+        self.assertEqual(self.rows(self.a, "observations"), [])
+
+    def test_secret_prompt_deletes_flagged_rows_then_exports(self):
+        token = "ghp_" + "A1b2C3d4" * 5
+        self.a.add_session()
+        self.a.add_observation("clean")
+        leak = self.a.add_observation("leak", narrative=f"the token is {token}", epoch=101)
+        worker = cm.Worker(self.a.worker_url)
+        with mock.patch.object(cm, "ask_tty", return_value=True) as prompt:
+            cm.export(self.a.cfg, self.a.state, worker)
+        self.assertIn("leak", prompt.call_args[0][0])
+        self.assertNotIn(token, prompt.call_args[0][0])
+        self.assertIn(("DELETE", f"/api/observation/{leak}", None), FakeWorker.requests)
+        self.assertEqual([r["title"] for r in self.rows(self.a, "observations")], ["clean"])
+        with mock.patch.object(cm, "ask_tty", return_value=False):
+            self.a.add_observation("leak again", narrative=f"the token is {token}", epoch=102)
+            with self.assertRaises(cm.CmSyncError):
+                cm.export(self.a.cfg, self.a.state, worker)
+
+    def test_export_refuses_without_redaction(self):
+        self.a.cfg.settings["CLAUDE_MEM_REDACT_ENABLED"] = "false"
+        with self.assertRaises(cm.CmSyncError):
+            self.a.export()
+        self.a.add_session()
+        self.a.add_observation("ok")
+        self.a.export(allow_unredacted=True)
+        self.assertEqual(len(self.rows(self.a, "observations")), 1)
+
+    def test_refile_imports_copies_then_deletes_originals(self):
+        self.a.add_session()
+        first = self.a.add_observation("one")
+        second = self.a.add_observation("two", epoch=101)
+        cm.refile(self.a.cfg, self.a.worker, "s1", "my-project")
+        posts = [r[2] for r in FakeWorker.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual([s["project"] for s in posts[0]["sessions"]], ["my-project"])
+        self.assertEqual({o["project"] for o in posts[0]["observations"]}, {"my-project"})
+        self.assertEqual({o["memory_session_id"] for o in posts[0]["observations"]}, {"mem-s1@my-project"})
+        deletes = [r[1] for r in FakeWorker.requests if r[0] == "DELETE"]
+        self.assertEqual(deletes, [f"/api/observation/{first}", f"/api/observation/{second}"])
+        with self.assertRaises(cm.CmSyncError):
+            cm.refile(self.a.cfg, self.a.worker, "missing", "my-project")
+
+    def test_sync_is_the_default_command(self):
+        commands = {"sync", "import", "export", "status"}
+        self.assertEqual(cm.with_default_command([], commands), ["sync"])
+        self.assertEqual(cm.with_default_command(["--exclude-flagged"], commands), ["sync", "--exclude-flagged"])
+        self.assertEqual(cm.with_default_command(["--repo", "/r", "-q"], commands), ["--repo", "/r", "sync", "-q"])
+        self.assertEqual(cm.with_default_command(["--state-dir=/s"], commands), ["--state-dir=/s", "sync"])
+        self.assertEqual(cm.with_default_command(["--repo", "/r", "import"], commands), ["--repo", "/r", "import"])
+        self.assertEqual(cm.with_default_command(["--help"], commands), ["--help"])
+
+    def test_import_posts_rows_with_their_sessions_once(self):
+        self.a.add_session()
+        self.a.add_observation("one")
+        self.a.add_observation("two", epoch=101)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        posts = [r[2] for r in FakeWorker.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(len(posts[0]["sessions"]), 1)
+        self.assertEqual(len(posts[0]["observations"]), 2)
+        FakeWorker.requests.clear()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertEqual([r for r in FakeWorker.requests if r[0] == "POST"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
