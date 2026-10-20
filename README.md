@@ -13,7 +13,7 @@ ln -sf ~/Projects/cm-sync/cm-sync ~/.local/bin/cm-sync   # or any directory on P
 
 On Windows, clone the same way and add the clone's folder to your user `PATH`; `cm-sync.cmd` runs it from cmd and PowerShell (through `py -3`, or `python` when the launcher is missing). Git Bash can use the `cm-sync` script as on macOS and Linux.
 
-The memory repo defaults to `~/claude-memory` cloned from `git@github.com:your-username/claude-memory.git`. Override with `CM_SYNC_REPO` / `--repo` and `CM_SYNC_REMOTE`.
+The memory repo defaults to `~/claude-memory`. If it doesn't exist yet, `cm-sync setup` asks for its git URL and clones it there. Override the path with `CM_SYNC_REPO` / `--repo`, and preset the URL with `CM_SYNC_REMOTE` (needed for `setup --yes` or non-interactive runs).
 
 On a new machine:
 
@@ -24,15 +24,15 @@ cm-sync         # same as `cm-sync sync`
 
 ## Commands
 
-| Command | Does |
-| --- | --- |
-| `cm-sync` / `cm-sync sync` | Pull → import → export → commit only this device's folder → push (sync is the default command) |
-| `cm-sync import` | Pull the memory repo, then import other devices' rows and apply their deletions (`--no-pull` to skip the pull, `--full` after a database reset) |
-| `cm-sync export` | Write this device's rows to `claude-mem/devices/<device-id>/` (`--with-prompts` to include raw prompts) |
-| `cm-sync status` | Worker, redaction, counts per device, last push |
-| `cm-sync url` | Print the worker URL (`CLAUDE_MEM_WORKER_HOST`/`PORT` from env, then settings, then `127.0.0.1:37700 + uid % 100`, `37777` on Windows) |
-| `cm-sync hooks` | Print Claude Code hooks that import on session start and sync on session end |
-| `cm-sync refile <session-id> <project>` | Move a session's observations and summaries to another project (claude-mem files a session under the folder it started in) |
+| Command                                 | Does                                                                                                                                            |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cm-sync` / `cm-sync sync`              | Pull → import → export → commit only this device's folder → push (sync is the default command)                                                  |
+| `cm-sync import`                        | Pull the memory repo, then import other devices' rows and apply their deletions (`--no-pull` to skip the pull, `--full` after a database reset) |
+| `cm-sync export`                        | Write this device's rows to `claude-mem/devices/<device-id>/` (`--with-prompts` to include raw prompts)                                         |
+| `cm-sync status`                        | Worker, redaction, counts per device, last push                                                                                                 |
+| `cm-sync url`                           | Print the worker URL (`CLAUDE_MEM_WORKER_HOST`/`PORT` from env, then settings, then `127.0.0.1:37700 + uid % 100`, `37777` on Windows)          |
+| `cm-sync hooks`                         | Print Claude Code hooks that import on session start and sync on session end                                                                    |
+| `cm-sync refile <session-id> <project>` | Move a session's observations and summaries to another project (claude-mem files a session under the folder it started in)                      |
 
 ## How it works
 

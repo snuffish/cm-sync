@@ -757,10 +757,17 @@ def setup(cfg, state, worker, assume_yes=False):
            "start a Claude Code session; the plugin's SessionStart hook starts the worker")
 
     is_repo = git(cfg, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0 if cfg.repo.exists() else False
-    if not is_repo and not cfg.repo.exists() and ask(f"Clone {cfg.remote} into {cfg.repo}?", assume_yes=assume_yes):
-        subprocess.run(["git", "clone", cfg.remote, str(cfg.repo)], check=False)
-        is_repo = git(cfg, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0
-    report(is_repo, f"memory repo at {cfg.repo}", f"git clone {cfg.remote} {cfg.repo}")
+    remote = None if cfg.remote == DEFAULT_REMOTE else cfg.remote
+    if not is_repo and not cfg.repo.exists():
+        if sys.stdin.isatty() and not assume_yes:
+            hint = f" [{remote}]" if remote else " (blank to skip)"
+            remote = input(f"Git URL of your memory repo to clone into {cfg.repo}{hint}: ").strip() or remote
+        if remote:
+            subprocess.run(["git", "clone", remote, str(cfg.repo)], check=False)
+            is_repo = git(cfg, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0
+    clone_fix = (f"git clone {remote} {cfg.repo}" if remote
+                 else "rerun `cm-sync setup` and enter your memory repo URL, or set CM_SYNC_REMOTE")
+    report(is_repo, f"memory repo at {cfg.repo}", clone_fix)
 
     auto_memory = claude_settings.get("autoMemoryDirectory")
     expected = tilde(cfg.repo)
