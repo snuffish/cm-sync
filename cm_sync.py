@@ -88,6 +88,7 @@ SECRET_PATTERNS = {
 DERIVED_SOURCES = ('"source":"memory-file"', '"source":"memory-import"')
 
 QUIET = False
+WINDOWS = os.name == "nt"
 
 
 class CmSyncError(Exception):
@@ -121,7 +122,10 @@ class Config:
         host = self.setting("CLAUDE_MEM_WORKER_HOST") or "127.0.0.1"
         if host == "localhost":
             host = "127.0.0.1"
-        port = self.setting("CLAUDE_MEM_WORKER_PORT") or str(37700 + os.getuid() % 100)
+        # claude-mem uses uid 77 where there is none (Windows)
+        getuid = getattr(os, "getuid", None)
+        uid = getuid() if getuid else 77
+        port = self.setting("CLAUDE_MEM_WORKER_PORT") or str(37700 + uid % 100)
         self.worker_url = f"http://{host}:{port}"
 
         self.repo = Path(repo or os.environ.get("CM_SYNC_REPO") or home / "claude-memory").expanduser()
@@ -149,10 +153,20 @@ def read_json(path, default):
         return default
 
 
+def tilde(path):
+    """`path` with the home directory shown as `~`, in forward slashes so it reads the same on Windows."""
+    path, home = Path(path), Path.home()
+    try:
+        return "~/" + path.relative_to(home).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def write_text_atomic(path, text, mode=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8") as f:
+    # LF on every platform, so files in the memory repo are byte-identical across devices
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     if mode is not None:
         os.chmod(tmp, mode)
@@ -273,7 +287,7 @@ def row_key(kind, row):
 def connect_ro(db_path):
     if not db_path.exists():
         raise CmSyncError(f"claude-mem database not found: {db_path}")
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     return con
 
@@ -639,7 +653,7 @@ def refile(cfg, worker, session_id, project):
 
 
 def git(cfg, *args, check=True):
-    result = subprocess.run(["git", "-C", str(cfg.repo), *args], capture_output=True, text=True)
+    result = subprocess.run(["git", "-C", str(cfg.repo), *args], capture_output=True, encoding="utf-8", errors="replace")
     if check and result.returncode != 0:
         raise CmSyncError(f"git {' '.join(args)} failed:\n{result.stderr.strip() or result.stdout.strip()}")
     return result
@@ -672,7 +686,7 @@ def pull(cfg):
 def run_gitleaks(path):
     if not shutil.which("gitleaks"):
         return
-    result = subprocess.run(["gitleaks", "dir", str(path), "--no-banner", "--redact"], capture_output=True, text=True)
+    result = subprocess.run(["gitleaks", "dir", str(path), "--no-banner", "--redact"], capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode == 1:
         raise CmSyncError(f"gitleaks found possible secrets in {path}, nothing was committed:\n{result.stdout.strip()}")
 
@@ -683,7 +697,7 @@ def sync(cfg, state, worker, **export_args):
     import_all(cfg, state, worker)
     result = export(cfg, state, worker, **export_args)
 
-    rel = str(DEVICES_DIR / device["id"])
+    rel = (DEVICES_DIR / device["id"]).as_posix()
     run_gitleaks(cfg.repo / rel)
     git(cfg, "add", "--", rel)
     if not git(cfg, "status", "--porcelain", "--", rel).stdout.strip():
@@ -729,7 +743,9 @@ def setup(cfg, state, worker, assume_yes=False):
             if fix:
                 print(f"   → {fix}")
 
-    for tool, why in (("python3", "runs cm-sync"), ("git", "syncs the memory repo"), ("bun", "claude-mem's worker needs it"), ("node", "claude-mem's hooks need it")):
+    pythons = ("py", "python") if WINDOWS else ("python3",)
+    report(any(shutil.which(p) for p in pythons), f"{' or '.join(pythons)} on PATH (runs cm-sync)", "install Python 3.9+")
+    for tool, why in (("git", "syncs the memory repo"), ("bun", "claude-mem's worker needs it"), ("node", "claude-mem's hooks need it")):
         report(bool(shutil.which(tool)), f"{tool} on PATH ({why})", f"install {tool}")
 
     claude_settings = read_json(Path.home() / ".claude" / "settings.json", {})
@@ -747,8 +763,8 @@ def setup(cfg, state, worker, assume_yes=False):
     report(is_repo, f"memory repo at {cfg.repo}", f"git clone {cfg.remote} {cfg.repo}")
 
     auto_memory = claude_settings.get("autoMemoryDirectory")
-    expected = str(cfg.repo).replace(str(Path.home()), "~", 1)
-    report(auto_memory in (expected, str(cfg.repo)), f"Claude Code autoMemoryDirectory is {expected}",
+    expected = tilde(cfg.repo)
+    report(bool(auto_memory) and Path(auto_memory).expanduser() == cfg.repo, f"Claude Code autoMemoryDirectory is {expected}",
            f'set "autoMemoryDirectory": "{expected}" in ~/.claude/settings.json', level="⚠️")
 
     if not cfg.redaction_enabled and cfg.settings_path.exists() and ask(
@@ -770,7 +786,7 @@ def setup(cfg, state, worker, assume_yes=False):
     legacy = cfg.repo / LEGACY_EXPORT_DIR
     report(not legacy.exists(), "no legacy Markdown export in the memory repo", f"delete {legacy} once you no longer need it", level="⚠️")
     roots = cfg.setting("CLAUDE_MEM_MEMORY_WATCH_ROOTS") or ""
-    report(str(cfg.repo / "claude-mem") not in roots.replace("~", str(Path.home())),
+    report((cfg.repo / "claude-mem").as_posix() not in roots.replace("\\", "/").replace("~", Path.home().as_posix()),
            "CLAUDE_MEM_MEMORY_WATCH_ROOTS doesn't watch the claude-mem export", "remove those roots from ~/.claude-mem/settings.json", level="⚠️")
 
     if not state.device:
@@ -818,8 +834,12 @@ def status(cfg, state, worker):
 
 
 def hooks():
-    path = str(Path(__file__).resolve()).replace(str(Path.home()), "~", 1)
-    script = f"python3 -I {path}"
+    path = Path(__file__).resolve()
+    if WINDOWS:
+        # Claude Code runs hooks through Git Bash on Windows, which has no python3: name this interpreter, quoted
+        script = f'"{Path(sys.executable).as_posix()}" -I "{path.as_posix()}"'
+    else:
+        script = f"python3 -I {tilde(path)}"
     snippet = {
         "hooks": {
             "SessionStart": [{"hooks": [{"type": "command", "command": f"{script} import --quiet || true", "timeout": 60}]}],
@@ -853,6 +873,10 @@ def with_default_command(argv, commands, default="sync"):
 
 def main(argv=None):
     global QUIET
+    if WINDOWS:
+        # Piped output (hooks) would otherwise use the ANSI code page and fail on ✅ and non-ASCII titles
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(prog="cm-sync", description="Sync claude-mem memory between devices through a git repo.")
     parser.add_argument("--repo", help="memory repo (default: $CM_SYNC_REPO or ~/claude-memory)")
     parser.add_argument("--state-dir", help="local state (default: $CM_SYNC_STATE_DIR or ~/.local/state/cm-sync)")

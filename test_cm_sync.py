@@ -293,6 +293,21 @@ class CmSyncTests(unittest.TestCase):
         cm.import_all(self.b.cfg, self.b.state, self.b.worker)
         self.assertEqual([r for r in FakeWorker.requests if r[0] == "POST"], [])
 
+    def test_worker_port_without_uid_matches_claude_mem(self):
+        env = {"CLAUDE_MEM_DATA_DIR": str(self.root / "none"), "CLAUDE_MEM_WORKER_HOST": "", "CLAUDE_MEM_WORKER_PORT": ""}
+        with mock.patch.dict("os.environ", env), mock.patch.object(cm.os, "getuid", None, create=True):
+            self.assertEqual(cm.Config(self.repo).worker_url, "http://127.0.0.1:37777")
+
+    def test_written_files_use_lf(self):
+        self.a.add_session()
+        self.a.add_observation("one")
+        self.a.export()
+        self.assertNotIn(b"\r\n", (self.a.device_dir() / "manifest.json").read_bytes())
+
+    def test_tilde_uses_forward_slashes(self):
+        self.assertEqual(cm.tilde(Path.home() / "a" / "b"), "~/a/b")
+        self.assertEqual(cm.tilde(self.root / "x"), (self.root / "x").as_posix())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,4 +8,7 @@ while [ -L "$src" ]; do
   src="$(readlink "$src")"
   [[ "$src" != /* ]] && src="$dir/$src"
 done
-exec python3 -I "$(cd -P "$(dirname "$src")" && pwd)/cm_sync.py" "$@"
+# Git Bash on Windows usually has python, not python3
+python=python3
+command -v python3 >/dev/null 2>&1 || python=python
+exec "$python" -I "$(cd -P "$(dirname "$src")" && pwd)/cm_sync.py" "$@"
