@@ -4,6 +4,10 @@
 Each device publishes only the rows it created to <repo>/claude-mem/devices/<id>/,
 plus tombstones for rows it deleted. Other devices import them through the
 claude-mem worker (POST /api/import, DELETE routes), never into SQLite directly.
+
+The one exception is work state (claude-mem's "My Work"): no worker route keeps
+its timestamps, so it is inserted the way claude-mem's own cloud sync does,
+with origin_device_id / origin_local_id.
 """
 
 import argparse
@@ -27,7 +31,9 @@ BATCH_BYTES = 4 * 1024 * 1024
 DEVICES_DIR = Path("claude-mem") / "devices"
 LEGACY_EXPORT_DIR = Path("claude-mem") / "macbook-pro"
 DEFAULT_REMOTE = "git@github.com:your-username/claude-memory.git"
-KINDS = ("sessions", "observations", "summaries", "prompts")
+KINDS = ("sessions", "observations", "summaries", "prompts", "work_state")
+# Kinds that go through POST /api/import
+IMPORT_KINDS = ("sessions", "observations", "summaries", "prompts")
 
 # Columns /api/import reads per table
 COLUMNS = {
@@ -48,6 +54,7 @@ COLUMNS = {
     "prompts": (
         "content_session_id", "platform_source", "prompt_number", "prompt_text", "created_at", "created_at_epoch",
     ),
+    "work_state": ("local_id", "project", "list_name", "fields", "created_at", "created_at_epoch"),
 }
 
 # Same columns the worker dedups on in importSdkSession / importObservation / importSessionSummary / importUserPrompt
@@ -62,6 +69,7 @@ KEY_COLUMNS = {
         "files_read", "files_edited", "notes", "prompt_number", "created_at_epoch",
     ),
     "prompts": ("content_session_id", "prompt_number"),
+    "work_state": ("local_id", "project", "list_name", "fields", "created_at_epoch"),
 }
 
 SCAN_COLUMNS = {
@@ -69,6 +77,7 @@ SCAN_COLUMNS = {
     "observations": ("text", "title", "subtitle", "facts", "narrative", "concepts", "files_read", "files_modified"),
     "summaries": ("request", "investigated", "learned", "completed", "next_steps", "notes"),
     "prompts": ("prompt_text",),
+    "work_state": ("list_name", "fields"),
 }
 
 SECRET_PATTERNS = {
@@ -86,6 +95,12 @@ SECRET_PATTERNS = {
 
 # Rows derived from Markdown memory files; those files sync on their own
 DERIVED_SOURCES = ('"source":"memory-file"', '"source":"memory-import"')
+
+# work_state_entries columns the direct insert writes; claude-mem before v15 lacks the origin ones
+WORK_STATE_COLUMNS = {
+    "project", "list_name", "fields", "created_at", "created_at_epoch",
+    "synced_at", "origin_device_id", "origin_local_id", "sync_rev",
+}
 
 QUIET = False
 WINDOWS = os.name == "nt"
@@ -317,14 +332,30 @@ def read_local(db_path):
             "p.prompt_number, p.prompt_text, p.created_at, p.created_at_epoch "
             "FROM user_prompts p LEFT JOIN sdk_sessions s ON s.id = p.session_db_id"
         )
+        # local_id is the row's id on the device that created it, so its key matches that device's tombstones
+        work_state = select(
+            "SELECT id, COALESCE(CAST(origin_local_id AS INTEGER), id) AS local_id, origin_device_id, origin_local_id, "
+            "project, list_name, fields, created_at, created_at_epoch FROM work_state_entries"
+        ) if has_work_state(con) else []
     finally:
         con.close()
-    return {"sessions": sessions, "observations": observations, "summaries": summaries, "prompts": prompts}
+    return {"sessions": sessions, "observations": observations, "summaries": summaries, "prompts": prompts,
+            "work_state": work_state}
+
+
+def has_work_state(con):
+    """True when work_state_entries exists with every column the direct insert writes."""
+    columns = {r[1] for r in con.execute("PRAGMA table_info(work_state_entries)")}
+    return WORK_STATE_COLUMNS <= columns
 
 
 def is_derived(row):
     metadata = (row.get("metadata") or "").replace(" ", "")
     return any(s in metadata for s in DERIVED_SOURCES)
+
+
+ROW_LABELS = {"sessions": "session", "observations": "observation", "summaries": "summary", "prompts": "prompt",
+              "work_state": "work-state entry"}
 
 
 def public(kind, row):
@@ -384,6 +415,9 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
                 continue
             if row_key(kind, row) not in blocked:
                 own[kind].append(row)
+    # Rows with an origin came from another device (cm-sync or claude-mem cloud sync)
+    own["work_state"] = [r for r in local["work_state"]
+                         if not r.get("origin_device_id") and row_key("work_state", r) not in blocked]
 
     by_memory_id = {s["memory_session_id"]: s for s in local["sessions"] if s.get("memory_session_id")}
     by_content_id = {(s["platform_source"], s["content_session_id"]): s for s in local["sessions"]}
@@ -405,19 +439,21 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
             for column, pattern in scan_secrets(kind, row):
                 flagged.setdefault((kind, row["id"]), (row, []))[1].append(f"{column} matches {pattern}")
     if flagged:
-        lines = [f"  {kind[:-1]} #{row_id} ({(row.get('title') or row.get('custom_title') or row.get('request') or '')[:60]}): {', '.join(hits)}"
+        lines = [f"  {ROW_LABELS[kind]} #{row_id} ({(row.get('title') or row.get('custom_title') or row.get('request') or row.get('list_name') or '')[:60]}): {', '.join(hits)}"
                  for (kind, row_id), (row, hits) in flagged.items()]
         listing = "possible secrets found:\n" + "\n".join(lines)
-        deletable = {k: v for k, v in flagged.items() if k[0] != "sessions"}
+        # No worker route deletes sessions or work state
+        deletable = {k: v for k, v in flagged.items() if k[0] not in ("sessions", "work_state")}
         if not exclude_flagged and worker and deletable and ask_tty(
                 listing + f"\nDelete these {len(deletable)} rows from claude-mem now?", default=True):
             for (kind, _), (row, _) in deletable.items():
                 worker.delete(kind, row)
                 all_present.discard(row_key(kind, row))
             info(f"Deleted {len(deletable)} rows")
-            kept = [k for k in flagged if k[0] == "sessions"]
+            kept = [k for k in flagged if k not in deletable]
             if kept:
-                warn("Kept local only (sessions are never deleted here): " + ", ".join(f"session #{i}" for _, i in kept))
+                warn("Kept local only (sessions and work state are never deleted here): "
+                     + ", ".join(f"{ROW_LABELS[kind]} #{i}" for kind, i in kept))
         elif not exclude_flagged:
             raise CmSyncError(
                 listing.replace("found:", "found, nothing was written:", 1) +
@@ -497,7 +533,7 @@ def batches(rows_by_kind, sessions, limit=BATCH_BYTES):
     session_keys = {id(s): k for k, s in sessions}
 
     def empty():
-        return {kind: [] for kind in KINDS}, {kind: [] for kind in KINDS}, set(), 2
+        return {kind: [] for kind in IMPORT_KINDS}, {kind: [] for kind in IMPORT_KINDS}, set(), 2
 
     payload, keys, included, size = empty()
     for kind in ("observations", "summaries", "prompts"):
@@ -511,7 +547,7 @@ def batches(rows_by_kind, sessions, limit=BATCH_BYTES):
                 return extra, len(json.dumps(row)) + sum(len(json.dumps(s)) for s in extra) + 2
 
             extra, row_size = cost()
-            if size + row_size > limit and any(payload[k] for k in KINDS):
+            if size + row_size > limit and any(payload[k] for k in IMPORT_KINDS):
                 yield payload, keys
                 payload, keys, included, size = empty()
                 extra, row_size = cost()
@@ -522,7 +558,7 @@ def batches(rows_by_kind, sessions, limit=BATCH_BYTES):
             payload[kind].append(row)
             keys[kind].append(key)
             size += row_size
-    if any(payload[k] for k in KINDS):
+    if any(payload[k] for k in IMPORT_KINDS):
         yield payload, keys
 
 
@@ -547,7 +583,7 @@ def import_all(cfg, state, worker, full=False):
         name = manifest.get("device_name") or d.name
         sessions = [(row_key("sessions", s), s) for s in read_jsonl(d / "sessions.jsonl")]
         rows = {}
-        for kind in ("observations", "summaries", "prompts"):
+        for kind in ("observations", "summaries", "prompts", "work_state"):
             rows[kind] = []
             for row in read_jsonl(d / f"{kind}.jsonl"):
                 key = row_key(kind, row)
@@ -564,7 +600,7 @@ def import_all(cfg, state, worker, full=False):
             imported += sum(stats.get(f"{k}Imported", 0) for k in ("observations", "summaries", "prompts"))
             skipped += sum(stats.get(f"{k}Skipped", 0) for k in ("observations", "summaries", "prompts"))
             bad = result.get("rejected") or {}
-            for kind in KINDS:
+            for kind in IMPORT_KINDS:
                 bad_idx = {r.get("index") for r in bad.get(kind, [])}
                 rejected += len(bad_idx) if kind != "sessions" else 0
                 for i, key in enumerate(keys[kind]):
@@ -572,6 +608,12 @@ def import_all(cfg, state, worker, full=False):
                         state.imported.add(key)
                 for r in bad.get(kind, [])[:5]:
                     warn(f"  {name}: {kind}[{r.get('index')}] rejected: {r.get('reason')}")
+        if rows["work_state"]:
+            added = insert_work_state(cfg, d.name, [row for _, row in rows["work_state"]])
+            if added is not None:
+                imported += added
+                skipped += len(rows["work_state"]) - added
+                state.imported.update(key for key, _ in rows["work_state"])
         info(f"{name}: {imported} imported, {skipped} already present, {rejected} rejected")
         totals["imported"] += imported
         totals["skipped"] += skipped
@@ -580,14 +622,14 @@ def import_all(cfg, state, worker, full=False):
     pending = {k: v for k, v in tombstones.items() if k not in state.tombstoned}
     if pending:
         local = read_local(cfg.db_path)
-        order = ("observations", "summaries", "prompts", "sessions")
+        order = ("observations", "summaries", "prompts", "sessions", "work_state")
         index = {kind: {row_key(kind, r): r for r in local[kind]} for kind in order}
         for kind in order:
             for key, t_kind in pending.items():
                 if t_kind != kind:
                     continue
                 row = index[kind].get(key)
-                if row is not None and worker.delete(kind, row):
+                if row is not None and (delete_work_state(cfg, row) if kind == "work_state" else worker.delete(kind, row)):
                     totals["deleted"] += 1
                 state.tombstoned.add(key)
         if totals["deleted"]:
@@ -595,6 +637,53 @@ def import_all(cfg, state, worker, full=False):
 
     state.save()
     return totals
+
+
+def connect_rw(db_path):
+    # timeout waits out the worker's write locks; the database is in WAL mode, so its reads go on
+    return sqlite3.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
+
+
+def insert_work_state(cfg, origin_device, rows):
+    """Insert another device's work-state rows the way claude-mem's cloud sync applies them.
+
+    Keeps created_at_epoch, which decides the latest value of every field. The unique
+    (origin_device_id, origin_local_id) index makes re-imports no-ops. Returns how many rows
+    were new, or None when this claude-mem has no origin columns.
+    """
+    con = connect_rw(cfg.db_path)
+    try:
+        if not has_work_state(con):
+            warn("cm-sync: claude-mem has no work-state origin columns (needs v15+), work state not imported")
+            return None
+        now = int(time.time() * 1000)
+        with con:
+            before = con.total_changes
+            con.executemany(
+                "INSERT OR IGNORE INTO work_state_entries (project, list_name, fields, created_at, created_at_epoch, "
+                "synced_at, origin_device_id, origin_local_id, sync_rev) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '1')",
+                [(r["project"], r["list_name"], r["fields"], r["created_at"], r["created_at_epoch"],
+                  now, origin_device, str(r["local_id"])) for r in rows],
+            )
+            return con.total_changes - before
+    except sqlite3.Error as e:
+        raise CmSyncError(f"work-state import failed, nothing was written ({e})") from e
+    finally:
+        con.close()
+
+
+def delete_work_state(cfg, row):
+    """Delete a work-state row that came from another device; this device's own rows are never deleted."""
+    if not row.get("origin_device_id"):
+        return False
+    con = connect_rw(cfg.db_path)
+    try:
+        with con:
+            cur = con.execute("DELETE FROM work_state_entries WHERE origin_device_id = ? AND origin_local_id = ?",
+                              (row["origin_device_id"], row["origin_local_id"]))
+            return cur.rowcount > 0
+    finally:
+        con.close()
 
 
 # ------------------------------------------------------------------ refile

@@ -24,6 +24,11 @@ CREATE TABLE session_summaries (id INTEGER PRIMARY KEY, memory_session_id TEXT N
   discovery_tokens INTEGER DEFAULT 0, merged_into_project TEXT);
 CREATE TABLE user_prompts (id INTEGER PRIMARY KEY, session_db_id INTEGER, content_session_id TEXT NOT NULL,
   prompt_number INTEGER NOT NULL, prompt_text TEXT NOT NULL, created_at TEXT NOT NULL, created_at_epoch INTEGER NOT NULL);
+CREATE TABLE work_state_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, list_name TEXT NOT NULL,
+  fields TEXT NOT NULL, created_at TEXT NOT NULL, created_at_epoch INTEGER NOT NULL, synced_at INTEGER,
+  origin_device_id TEXT, origin_local_id TEXT, sync_rev TEXT NOT NULL DEFAULT '1');
+CREATE UNIQUE INDEX ux_work_state_entries_origin ON work_state_entries(origin_device_id, origin_local_id)
+  WHERE origin_device_id IS NOT NULL;
 """
 
 
@@ -100,6 +105,18 @@ class Env:
         return self.sql(
             "INSERT INTO observations (memory_session_id, project, type, title, narrative, facts, created_at, created_at_epoch, metadata) "
             "VALUES (?, 'GR', ?, ?, ?, '[]', '2026-10-20', ?, ?)", "mem-" + sid, type_, title, narrative, epoch, metadata)
+
+    def add_work_state(self, fields, epoch, list_name="suite"):
+        return self.sql(
+            "INSERT INTO work_state_entries (project, list_name, fields, created_at, created_at_epoch) VALUES ('GR', ?, ?, '2026-10-20', ?)",
+            list_name, json.dumps(fields), epoch)
+
+    def work_state(self):
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute("SELECT * FROM work_state_entries ORDER BY created_at_epoch, id")]
+        con.close()
+        return rows
 
     def export(self, **kw):
         return cm.export(self.cfg, self.state, None, **kw)
@@ -292,6 +309,91 @@ class CmSyncTests(unittest.TestCase):
         FakeWorker.requests.clear()
         cm.import_all(self.b.cfg, self.b.state, self.b.worker)
         self.assertEqual([r for r in FakeWorker.requests if r[0] == "POST"], [])
+
+    def test_work_state_round_trip_keeps_timestamps(self):
+        first = self.a.add_work_state({"task": "scout", "status": "doing"}, epoch=1000)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        [row] = self.b.work_state()
+        self.assertEqual(row["created_at_epoch"], 1000)
+        self.assertEqual(json.loads(row["fields"]), {"task": "scout", "status": "doing"})
+        self.assertEqual(row["origin_device_id"], self.a.state.device["id"])
+        self.assertEqual(row["origin_local_id"], str(first))
+        self.assertIsNotNone(row["synced_at"])
+
+    def test_imported_work_state_is_not_exported_again(self):
+        self.a.add_work_state({"task": "from a"}, epoch=1000)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.b.add_work_state({"task": "from b"}, epoch=2000)
+        self.b.export()
+        self.assertEqual([json.loads(r["fields"]) for r in self.rows(self.b, "work_state")], [{"task": "from b"}])
+
+    def test_work_state_import_is_idempotent(self):
+        self.a.add_work_state({"task": "scout"}, epoch=1000)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        totals = cm.import_all(self.b.cfg, self.b.state, self.b.worker, full=True)
+        self.assertEqual(len(self.b.work_state()), 1)
+        self.assertEqual((totals["imported"], totals["skipped"]), (0, 1))
+
+    def test_newer_local_entry_still_wins(self):
+        self.a.add_work_state({"task": "scout", "status": "doing"}, epoch=1000)
+        self.a.export()
+        self.b.add_work_state({"task": "scout", "status": "done"}, epoch=2000)
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertEqual([json.loads(r["fields"])["status"] for r in self.b.work_state()], ["doing", "done"])
+
+    def test_work_state_never_sent_to_api_import(self):
+        self.a.add_session()
+        self.a.add_observation("one")
+        self.a.add_work_state({"task": "scout"}, epoch=1000)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        posts = [r[2] for r in FakeWorker.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertNotIn("work_state", posts[0])
+        self.assertEqual(len(self.b.work_state()), 1)
+
+    def test_missing_work_state_table_is_skipped(self):
+        self.a.sql("DROP TABLE work_state_entries")
+        self.a.add_session()
+        self.a.add_observation("one")
+        self.a.export()
+        self.assertEqual(self.rows(self.a, "work_state"), [])
+        self.b.add_work_state({"task": "from b"}, epoch=1000)
+        self.b.export()
+        with mock.patch.object(cm, "warn") as warned:
+            cm.import_all(self.a.cfg, self.a.state, self.a.worker)
+        self.assertIn("work state not imported", warned.call_args[0][0])
+        self.assertEqual(self.a.state.imported, set())
+
+    def test_work_state_tombstone_deletes_only_synced_copy(self):
+        doomed = self.a.add_work_state({"task": "doomed"}, epoch=1000)
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.b.add_work_state({"task": "doomed"}, epoch=1000)  # B's own row with the same content
+        self.a.sql("DELETE FROM work_state_entries WHERE id = ?", doomed)
+        self.a.export()
+        totals = cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertEqual(totals["deleted"], 1)
+        self.assertEqual([r["origin_device_id"] for r in self.b.work_state()], [None])
+
+    def test_secret_in_work_state_fields_kept_local(self):
+        token = "ghp_" + "A1b2C3d4" * 5
+        self.a.add_work_state({"task": "clean"}, epoch=1000)
+        self.a.add_work_state({"task": "leak", "note": f"token {token}"}, epoch=1001)
+        worker = cm.Worker(self.a.worker_url)
+        with mock.patch.object(cm, "ask_tty", return_value=True) as prompt:
+            with self.assertRaises(cm.CmSyncError) as ctx:
+                cm.export(self.a.cfg, self.a.state, worker)
+        prompt.assert_not_called()
+        self.assertIn("work-state entry", str(ctx.exception))
+        self.assertNotIn(token, str(ctx.exception))
+        cm.export(self.a.cfg, self.a.state, worker, exclude_flagged=True)
+        self.assertEqual([json.loads(r["fields"])["task"] for r in self.rows(self.a, "work_state")], ["clean"])
+        self.assertNotIn("DELETE", [r[0] for r in FakeWorker.requests])
 
     def test_worker_port_without_uid_matches_claude_mem(self):
         env = {"CLAUDE_MEM_DATA_DIR": str(self.root / "none"), "CLAUDE_MEM_WORKER_HOST": "", "CLAUDE_MEM_WORKER_PORT": ""}

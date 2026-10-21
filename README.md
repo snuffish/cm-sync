@@ -2,7 +2,7 @@
 
 Keeps [claude-mem](https://github.com/thedotmack/claude-mem) memory the same on every computer, through a private git repo.
 
-Each device publishes only the rows it created, as JSON Lines in `<memory repo>/claude-mem/devices/<device-id>/`, and imports the other devices' rows through its own claude-mem worker (`POST /api/import`), so search and vector indexes stay correct. Nothing writes to `claude-mem.db` directly. Python 3.9+ standard library only; macOS, Linux and Windows.
+Each device publishes only the rows it created, as JSON Lines in `<memory repo>/claude-mem/devices/<device-id>/`, and imports the other devices' rows through its own claude-mem worker (`POST /api/import`), so search and vector indexes stay correct. The one exception is work state (see below); nothing else writes to `claude-mem.db` directly. Python 3.9+ standard library only; macOS, Linux and Windows.
 
 ## Install
 
@@ -36,6 +36,7 @@ cm-sync         # same as `cm-sync sync`
 
 ## How it works
 
+- Work state (the lists behind claude-mem's "My Work" page) syncs too. No worker route keeps its timestamps, and claude-mem decides each task's current status by the latest timestamp, so cm-sync inserts other devices' entries into `work_state_entries` directly, the way claude-mem's own cloud sync does: original `created_at_epoch`, plus `origin_device_id`/`origin_local_id` so re-imports are no-ops and imported entries are never published again. It needs claude-mem v15+, and is skipped with a warning on older versions. The tool calls that link a list to the request it came from don't sync, so on other devices the lists can show under "work records need a linked human request" rather than as cards. Pick "All projects" and a wide enough time range to see older entries.
 - Deleting a row on the device that created it publishes a tombstone, and the other devices delete their copy on the next import.
 - Export refuses to run while claude-mem redaction is off and skips `sensitive` observations. When a row looks like a secret it asks whether to delete it, otherwise it aborts (`--exclude-flagged` keeps those rows local instead).
 - Only this device's folder is staged and committed, so other files in the memory repo are never touched.
