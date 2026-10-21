@@ -7,8 +7,8 @@ Each device publishes only the rows it created, as JSON Lines in `<memory repo>/
 ## Install
 
 ```bash
-git clone git@github.com:your-username/cm-sync.git ~/Projects/cm-sync
-ln -sf ~/Projects/cm-sync/cm-sync ~/.local/bin/cm-sync   # or any directory on PATH
+git clone https://github.com/snuffish/cm-sync ~/cm-sync
+ln -sf ~/cm-sync/cm-sync ~/.local/bin/cm-sync   # or any directory on PATH
 ```
 
 On Windows, clone the same way and add the clone's folder to your user `PATH`; `cm-sync.cmd` runs it from cmd and PowerShell (through `py -3`, or `python` when the launcher is missing). Git Bash can use the `cm-sync` script as on macOS and Linux.
