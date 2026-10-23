@@ -1,11 +1,13 @@
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import cm_sync as cm
@@ -406,6 +408,33 @@ class CmSyncTests(unittest.TestCase):
         self.a.add_observation("one")
         self.a.export()
         self.assertNotIn(b"\r\n", (self.a.device_dir() / "manifest.json").read_bytes())
+
+    def test_pull_reports_conflicting_autostash(self):
+        ident = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def run(cwd, *args):
+            subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, env={**os.environ, **ident})
+
+        run(self.root, "init", "--quiet", "--bare", "-b", "main", "remote.git")
+        for name in ("one", "two"):
+            run(self.root, "clone", "--quiet", "remote.git", name)
+        one, two = self.root / "one", self.root / "two"
+        (one / "MEMORY.md").write_text("a\n")
+        run(one, "add", "MEMORY.md")
+        run(one, "commit", "--quiet", "-m", "init")
+        run(one, "push", "--quiet", "-u", "origin", "main")
+        run(two, "pull", "--quiet", "origin", "main")
+        run(two, "branch", "--quiet", "-u", "origin/main")
+        (one / "MEMORY.md").write_text("a\nupstream\n")
+        run(one, "commit", "--quiet", "-am", "upstream")
+        run(one, "push", "--quiet")
+        (two / "MEMORY.md").write_text("a\nlocal\n")
+
+        cfg = SimpleNamespace(repo=two)
+        with self.assertRaisesRegex(cm.CmSyncError, r"unmerged files .*MEMORY\.md[\s\S]*git stash list"):
+            cm.pull(cfg)
+        with self.assertRaisesRegex(cm.CmSyncError, "unmerged files"):
+            cm.pull(cfg)
 
     def test_tilde_uses_forward_slashes(self):
         self.assertEqual(cm.tilde(Path.home() / "a" / "b"), "~/a/b")

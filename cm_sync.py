@@ -792,10 +792,22 @@ def has_upstream(cfg):
     return git(cfg, "rev-parse", "--abbrev-ref", "@{upstream}", check=False).returncode == 0
 
 
+def require_no_conflicts(cfg):
+    unmerged = git(cfg, "diff", "--name-only", "--diff-filter=U").stdout.split()
+    if not unmerged:
+        return
+    stashed = "; your local edits are also kept in `git stash list`" if git(cfg, "stash", "list").stdout.strip() else ""
+    raise CmSyncError(
+        f"unmerged files in {cfg.repo}: {', '.join(unmerged)}\n"
+        f"Resolve them, `git add` them{stashed}, then run cm-sync again"
+    )
+
+
 def pull(cfg):
     require_repo(cfg)
     if not has_upstream(cfg):
         return
+    require_no_conflicts(cfg)
     branch = git(cfg, "symbolic-ref", "--short", "HEAD").stdout.strip()
     remote = git(cfg, "config", f"branch.{branch}.remote").stdout.strip()
     merge = git(cfg, "config", f"branch.{branch}.merge").stdout.strip().removeprefix("refs/heads/")
@@ -804,6 +816,8 @@ def pull(cfg):
     if git(cfg, *args, check=False).returncode != 0:
         time.sleep(1)
         git(cfg, *args)
+    # A conflicting autostash pop still exits 0, leaving the conflict for the next pull to trip over
+    require_no_conflicts(cfg)
     sha, _, subject = git(cfg, "log", "-1", "--format=%h %s").stdout.strip().partition(" ")
     step("Pulled", f"{paint(sha, 'yellow')} {subject}")
 
