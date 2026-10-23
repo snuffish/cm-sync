@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -409,6 +410,15 @@ class CmSyncTests(unittest.TestCase):
     def test_tilde_uses_forward_slashes(self):
         self.assertEqual(cm.tilde(Path.home() / "a" / "b"), "~/a/b")
         self.assertEqual(cm.tilde(self.root / "x"), (self.root / "x").as_posix())
+
+    def test_paint_only_on_terminals(self):
+        tty = mock.Mock(**{"isatty.return_value": True})
+        pipe = mock.Mock(**{"isatty.return_value": False})
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True):
+            self.assertEqual(cm.paint("x", "bold", stream=tty), "\033[1mx\033[0m")
+            self.assertEqual(cm.paint("x", "bold", stream=pipe), "x")
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color", "NO_COLOR": "1"}, clear=True):
+            self.assertEqual(cm.paint("x", "bold", stream=tty), "x")
 
 
 if __name__ == "__main__":

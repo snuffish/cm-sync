@@ -110,13 +110,48 @@ class CmSyncError(Exception):
     pass
 
 
+STYLES = {"bold": 1, "dim": 2, "red": 31, "green": 32, "yellow": 33, "blue": 34, "magenta": 35, "cyan": 36}
+STEPS = {
+    "Pulled": ("↓", "cyan"),
+    "Imported": ("↓", "blue"),
+    "Deleted": ("✗", "yellow"),
+    "Exported": ("↑", "magenta"),
+    "Published": ("↑", "green"),
+}
+
+
+def colored(stream):
+    """ANSI colours only on a terminal and never with NO_COLOR; on Windows only where the terminal announces itself."""
+    if "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb" or not stream.isatty():
+        return False
+    return not WINDOWS or bool(os.environ.get("WT_SESSION") or os.environ.get("TERM"))
+
+
+def paint(text, *styles, stream=None):
+    if not colored(stream or sys.stdout):
+        return str(text)
+    return f"\033[{';'.join(str(STYLES[s]) for s in styles)}m{text}\033[0m"
+
+
 def info(msg):
     if not QUIET:
         print(msg)
 
 
-def warn(msg):
-    print(msg, file=sys.stderr)
+def warn(msg, style="yellow"):
+    print(paint(msg, style, stream=sys.stderr), file=sys.stderr)
+
+
+def step(label, text):
+    """One line of sync progress: a coloured arrow and label, padded to one column."""
+    glyph, color = STEPS[label]
+    info(paint(f"{glyph} {label + ':':<12}", color, "bold") + text)
+
+
+def counted(*parts):
+    """`(n, noun)` pairs as `n noun · n noun`, leaving out the zero counts."""
+    shown = [f"{paint(n, 'bold')} {noun}" for n, noun in parts if n]
+    return paint(" · ", "dim").join(shown) or paint("nothing", "dim")
 
 
 # ------------------------------------------------------------------ config
@@ -502,8 +537,8 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
             state.exported[key] = kind
     state.save()
 
-    counts = ", ".join(f"{len(published[k])} {k}" for k in KINDS if k != "prompts" or with_prompts)
-    info(f"Exported {counts}, {len(new_tombstones)} new tombstones -> {out}")
+    step("Exported", counted(*((len(published[k]), k) for k in KINDS if k != "prompts" or with_prompts), (len(new_tombstones), "new tombstones")))
+    info(" " * 14 + paint(f"→ {tilde(out.parent)}/{device['id'][:8]}…", "dim"))
     return {"published": {k: len(v) for k, v in published.items()}, "tombstones": len(new_tombstones)}
 
 
@@ -567,7 +602,7 @@ def import_all(cfg, state, worker, full=False):
     worker.require_health()
     devices = other_devices(cfg, device["id"])
     if not devices:
-        info("Nothing to import: no other devices in " + str(cfg.devices_root))
+        step("Imported", paint("nothing, no other devices in " + tilde(cfg.devices_root), "dim"))
         return {"imported": 0, "skipped": 0, "rejected": 0, "deleted": 0}
 
     tombstones = {}
@@ -590,7 +625,7 @@ def import_all(cfg, state, worker, full=False):
                 if key not in blocked and key not in known:
                     rows[kind].append((key, row))
         if not any(rows.values()):
-            info(f"{name}: up to date")
+            step("Imported", f"{name}: " + paint("up to date", "dim"))
             continue
 
         imported = skipped = rejected = 0
@@ -614,7 +649,7 @@ def import_all(cfg, state, worker, full=False):
                 imported += added
                 skipped += len(rows["work_state"]) - added
                 state.imported.update(key for key, _ in rows["work_state"])
-        info(f"{name}: {imported} imported, {skipped} already present, {rejected} rejected")
+        step("Imported", f"{name}: " + counted((imported, "new"), (skipped, "already present"), (rejected, "rejected")))
         totals["imported"] += imported
         totals["skipped"] += skipped
         totals["rejected"] += rejected
@@ -633,7 +668,7 @@ def import_all(cfg, state, worker, full=False):
                     totals["deleted"] += 1
                 state.tombstoned.add(key)
         if totals["deleted"]:
-            info(f"Applied {totals['deleted']} deletions from other devices")
+            step("Deleted", f"{totals['deleted']} rows deleted on other devices")
 
     state.save()
     return totals
@@ -769,7 +804,8 @@ def pull(cfg):
     if git(cfg, *args, check=False).returncode != 0:
         time.sleep(1)
         git(cfg, *args)
-    info("Pulled " + git(cfg, "log", "-1", "--format=%h %s").stdout.strip())
+    sha, _, subject = git(cfg, "log", "-1", "--format=%h %s").stdout.strip().partition(" ")
+    step("Pulled", f"{paint(sha, 'yellow')} {subject}")
 
 
 def run_gitleaks(path):
@@ -790,17 +826,18 @@ def sync(cfg, state, worker, **export_args):
     run_gitleaks(cfg.repo / rel)
     git(cfg, "add", "--", rel)
     if not git(cfg, "status", "--porcelain", "--", rel).stdout.strip():
-        info("Nothing new to publish")
+        step("Published", paint("nothing new", "dim"))
         return
     rows = sum(result["published"].values())
-    git(cfg, "commit", "--quiet", "--no-verify", "-m", f"cm-sync: {device['name']} {rows} rows, {result['tombstones']} tombstones", "--", rel)
+    tombstones = f", {result['tombstones']} tombstones" if result["tombstones"] else ""
+    git(cfg, "commit", "--quiet", "--no-verify", "-m", f"cm-sync: {device['name']} {rows} rows{tombstones}", "--", rel)
     if not has_upstream(cfg):
-        info("Committed locally (no upstream branch to push to)")
+        step("Published", "committed locally (no upstream branch to push to)")
         return
     if git(cfg, "push", "--quiet", check=False).returncode != 0:
         pull(cfg)
         git(cfg, "push", "--quiet")
-    info("Pushed")
+    step("Published", "pushed")
 
 
 # ------------------------------------------------------------------ setup / status / hooks
@@ -1027,7 +1064,7 @@ def main(argv=None):
         elif args.command == "refile":
             refile(cfg, worker, args.session, args.project)
     except CmSyncError as e:
-        warn(f"cm-sync: {e}")
+        warn(f"cm-sync: {e}", "red")
         return 2
     return 0
 
