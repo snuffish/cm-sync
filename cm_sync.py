@@ -128,7 +128,7 @@ def colored(stream):
 
 
 def paint(text, *styles, stream=None):
-    if not colored(stream or sys.stdout):
+    if not styles or not text or not colored(stream or sys.stdout):
         return str(text)
     return f"\033[{';'.join(str(STYLES[s]) for s in styles)}m{text}\033[0m"
 
@@ -935,35 +935,58 @@ def setup(cfg, state, worker, assume_yes=False):
 
 
 def status(cfg, state, worker):
-    health = worker.health()
-    print(f"Worker:     {cfg.worker_url} " + (f"v{health.get('version')} ok" if health else "not running"))
-    print(f"Database:   {cfg.db_path}")
-    print(f"Repo:       {cfg.repo}")
-    print(f"Redaction:  {'on' if cfg.redaction_enabled else 'OFF'}")
-    cloud = worker.sync_status() if health else None
-    print(f"Cloud sync: {'configured' if (cloud or {}).get('configured') else 'not configured'}")
-    device = state.device
-    print(f"Device:     {device['name']} ({device['id']})" if device else "Device:     none (run `cm-sync setup`)")
+    def row(label, value):
+        print(f"  {label + ':':<12}{value}")
 
+    health = worker.health()
+    print(paint("claude-mem", "bold"))
+    if health:
+        row("Worker", paint("●", "green") + f" v{health.get('version')} at {cfg.worker_url}")
+    else:
+        row("Worker", paint("● not running", "red") + f" at {cfg.worker_url}")
+    row("Database", tilde(cfg.db_path))
+    row("Redaction", paint("on", "green") if cfg.redaction_enabled else paint("OFF", "red", "bold"))
+    cloud = worker.sync_status() if health else None
+    row("Cloud sync", "configured" if (cloud or {}).get("configured") else paint("not configured", "dim"))
     if cfg.db_path.exists():
         local = read_local(cfg.db_path)
-        print("Local:      " + ", ".join(f"{len(local[k])} {k}" for k in KINDS))
-    print(f"State:      {len(state.exported)} published, {len(state.imported)} imported, {len(state.tombstoned)} tombstones applied")
+        row("Local", counted(*((len(local[k]), k) for k in KINDS)))
 
+    device = state.device
+    print()
+    if device:
+        print(paint(f"This device: {device['name']}", "bold") + " " + paint(device["id"][:8] + "…", "dim"))
+    else:
+        print(paint("This device: ", "bold") + paint("none, run `cm-sync setup`", "yellow"))
+    row("State", counted((len(state.exported), "published"), (len(state.imported), "imported"),
+                         (len(state.tombstoned), "tombstones applied")))
+    in_git = cfg.devices_root.is_dir() and git(cfg, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0
+    if device and in_git:
+        last = git(cfg, "log", "-1", "--format=%h %cr", "--", str(DEVICES_DIR / device["id"]), check=False).stdout.strip()
+        sha, _, when = last.partition(" ")
+        row("Last push", f"{paint(sha, 'yellow')} {when}" if last else paint("never", "dim"))
+
+    print()
+    print(paint("Repo: ", "bold") + tilde(cfg.repo))
     if cfg.devices_root.is_dir():
+        devices = []
         for d in sorted(p for p in cfg.devices_root.iterdir() if p.is_dir()):
             manifest = read_json(d / "manifest.json", {})
-            counts = manifest.get("counts", {})
             mine = " (this device)" if device and d.name == device["id"] else ""
+            devices.append((manifest.get("device_name", d.name), mine, f"v{manifest.get('claude_mem_version') or '?'}", manifest, d))
+        name_width = max((len(name + mine) for name, mine, *_ in devices), default=0)
+        version_width = max((len(version) for _, _, version, *_ in devices), default=0)
+        for name, mine, version, manifest, d in devices:
+            counts = manifest.get("counts", {})
             tomb = len(read_jsonl(d / "tombstones.jsonl"))
-            print(f"  {manifest.get('device_name', d.name)}{mine}: "
-                  + ", ".join(f"{counts.get(k, 0)} {k}" for k in KINDS)
-                  + f", {tomb} tombstones, claude-mem v{manifest.get('claude_mem_version')}")
-        if device and git(cfg, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0:
-            last = git(cfg, "log", "-1", "--format=%h %cr", "--", str(DEVICES_DIR / device["id"]), check=False).stdout.strip()
-            print(f"Last push:  {last or 'never'}")
+            print("  " + paint(name, "green" if mine else "bold") + paint(mine, "dim")
+                  + " " * (name_width - len(name + mine) + 2)
+                  + paint(f"{version:<{version_width}}", "dim") + "  "
+                  + counted(*((counts.get(k, 0), k) for k in KINDS), (tomb, "tombstones")))
+        if not devices:
+            print("  " + paint("no devices yet", "dim"))
     if (cfg.repo / LEGACY_EXPORT_DIR).exists():
-        warn(f"⚠️  legacy Markdown export still in {cfg.repo / LEGACY_EXPORT_DIR}")
+        warn(f"⚠️  legacy Markdown export still in {tilde(cfg.repo / LEGACY_EXPORT_DIR)}")
 
 
 def hooks():
