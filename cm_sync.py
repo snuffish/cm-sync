@@ -178,7 +178,7 @@ class Config:
         port = self.setting("CLAUDE_MEM_WORKER_PORT") or str(37700 + uid % 100)
         self.worker_url = f"http://{host}:{port}"
 
-        self.repo = Path(repo or os.environ.get("CM_SYNC_REPO") or home / "claude-memory").expanduser()
+        self.repo = Path(repo or os.environ.get("CM_SYNC_REPO") or home / ".claude-memory").expanduser()
         self.remote = os.environ.get("CM_SYNC_REMOTE") or DEFAULT_REMOTE
         xdg_state = os.environ.get("XDG_STATE_HOME") or str(home / ".local" / "state")
         self.state_dir = Path(state_dir or os.environ.get("CM_SYNC_STATE_DIR") or Path(xdg_state) / "cm-sync").expanduser()
@@ -1048,7 +1048,7 @@ def main(argv=None):
         for stream in (sys.stdout, sys.stderr):
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(prog="cm-sync", description="Sync claude-mem memory between devices through a git repo.")
-    parser.add_argument("--repo", help="memory repo (default: $CM_SYNC_REPO or ~/claude-memory)")
+    parser.add_argument("--repo", help="memory repo (default: $CM_SYNC_REPO or ~/.claude-memory)")
     parser.add_argument("--state-dir", help="local state (default: $CM_SYNC_STATE_DIR or ~/.local/state/cm-sync)")
     sub = parser.add_subparsers(dest="command", required=True)
 

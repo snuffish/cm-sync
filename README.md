@@ -13,7 +13,7 @@ ln -sf ~/cm-sync/cm-sync ~/.local/bin/cm-sync   # or any directory on PATH
 
 On Windows, clone the same way and add the clone's folder to your user `PATH`; `cm-sync.cmd` runs it from cmd and PowerShell (through `py -3`, or `python` when the launcher is missing). Git Bash can use the `cm-sync` script as on macOS and Linux.
 
-The memory repo defaults to `~/claude-memory`. If it doesn't exist yet, `cm-sync setup` asks for its git URL and clones it there. Override the path with `CM_SYNC_REPO` / `--repo`, and preset the URL with `CM_SYNC_REMOTE` (needed for `setup --yes` or non-interactive runs).
+The memory repo defaults to `~/.claude-memory`. If it doesn't exist yet, `cm-sync setup` asks for its git URL and clones it there. Override the path with `CM_SYNC_REPO` / `--repo`, and preset the URL with `CM_SYNC_REMOTE` (needed for `setup --yes` or non-interactive runs).
 
 On a new machine:
 
@@ -46,8 +46,8 @@ cm-sync         # same as `cm-sync sync`
 If a secret reaches a commit anyway, deleting the row is not enough: rewrite the memory repo's history and re-clone it on every device.
 
 ```bash
-git -C ~/claude-memory filter-repo --path claude-mem/devices/<device-id>/<file> --invert-paths
-git -C ~/claude-memory push --force
+git -C ~/.claude-memory filter-repo --path claude-mem/devices/<device-id>/<file> --invert-paths
+git -C ~/.claude-memory push --force
 ```
 
 ## Tests
