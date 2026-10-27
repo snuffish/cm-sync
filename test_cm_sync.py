@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -35,8 +37,17 @@ CREATE UNIQUE INDEX ux_work_state_entries_origin ON work_state_entries(origin_de
 """
 
 
+RULES_ROUTE = "/api/work-view/rules/load-in-claude-code"
+
+
+def rule(rule_id, status="on", set_by="approved"):
+    return {"task": f"Rule: {rule_id}", "rule_id": rule_id, "scope_tier": "everywhere", "scope_name": "Everywhere",
+            "when": "", "then": f"rule {rule_id}", "set_by": set_by, "status": status}
+
+
 class FakeWorker(BaseHTTPRequestHandler):
     requests = []
+    rules_route = True
 
     def log_message(self, *args):
         pass
@@ -56,6 +67,9 @@ class FakeWorker(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.requests.append(("POST", self.path, body))
+        if self.path == RULES_ROUTE:
+            self._reply(200 if self.rules_route else 404, {})
+            return
         stats = {f"{k}Imported": len(body.get(k, [])) for k in ("sessions", "summaries", "observations", "prompts")}
         self._reply(200, {"stats": stats, "rejected": {}})
 
@@ -88,6 +102,7 @@ class Env:
         cfg.data_dir, cfg.db_path, cfg.settings_path = self.dir, self.db, self.dir / "settings.json"
         cfg.settings = json.loads(cfg.settings_path.read_text())
         cfg.worker_url = self.worker_url
+        cfg.rules_path, cfg.claude_md = self.dir / "MY-RULES.md", self.dir / "CLAUDE.md"
         self.cfg = cfg
         self.state = cm.State(cfg)
         self.worker = cm.Worker(self.worker_url)
@@ -135,6 +150,7 @@ class CmSyncTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         FakeWorker.requests = []
+        FakeWorker.rules_route = True
         self.server = HTTPServer(("127.0.0.1", 0), FakeWorker)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         url = f"http://127.0.0.1:{self.server.server_port}"
@@ -397,6 +413,51 @@ class CmSyncTests(unittest.TestCase):
         cm.export(self.a.cfg, self.a.state, worker, exclude_flagged=True)
         self.assertEqual([json.loads(r["fields"])["task"] for r in self.rows(self.a, "work_state")], ["clean"])
         self.assertNotIn("DELETE", [r[0] for r in FakeWorker.requests])
+
+    def load_rules(self, env):
+        env.cfg.claude_md.write_text("# mine\n\n@" + cm.tilde(env.cfg.rules_path) + "\n")
+
+    def rule_rebuilds(self):
+        return [r for r in FakeWorker.requests if r[1] == RULES_ROUTE]
+
+    def test_every_import_rebuilds_rules_when_loaded(self):
+        self.a.add_work_state(rule("r1"), epoch=1000, list_name="my-rules")
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertEqual(self.rule_rebuilds(), [])
+        self.load_rules(self.b)
+        # The rule was imported before the file was loaded: the next import still rebuilds
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertEqual(self.rule_rebuilds(), [("POST", RULES_ROUTE, {})])
+
+    def test_old_worker_warns_and_import_succeeds(self):
+        FakeWorker.rules_route = False
+        self.load_rules(self.b)
+        self.a.add_work_state(rule("r1"), epoch=1000, list_name="my-rules")
+        self.a.export()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            totals = cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        self.assertEqual(totals["imported"], 1)
+        self.assertIn("claude-mem 15.1+", stderr.getvalue())
+
+    def test_rule_counts_fold_latest_entry_by_timestamp(self):
+        self.a.add_work_state(rule("r1"), epoch=1000, list_name="my-rules")
+        self.a.add_work_state(rule("r1", status="off"), epoch=2000, list_name="my-rules")
+        self.a.add_work_state(rule("r2", set_by="owner"), epoch=1000, list_name="my-rules")
+        # Inserted later but older: an imported entry must not win by id
+        self.a.add_work_state(rule("r2", status="off", set_by="owner"), epoch=500, list_name="my-rules")
+        self.a.add_work_state(rule("r3", set_by="learned"), epoch=1000, list_name="my-rules")
+        self.a.add_work_state({"task": "scout", "status": "on"}, epoch=1000, list_name="my-rules")
+        self.a.add_work_state(rule("r4"), epoch=1000)
+        self.assertEqual(cm.rule_counts(self.a.db), (1, 3))
+
+    def test_rules_loaded_needs_the_whole_line(self):
+        line = "@" + cm.tilde(self.a.cfg.rules_path)
+        self.a.cfg.claude_md.write_text(f"see {line}\n{line}.bak\n")
+        self.assertFalse(cm.rules_loaded(self.a.cfg))
+        self.a.cfg.claude_md.write_text(f"intro\n  {line}  \n")
+        self.assertTrue(cm.rules_loaded(self.a.cfg))
 
     def test_worker_port_without_uid_matches_claude_mem(self):
         env = {"CLAUDE_MEM_DATA_DIR": str(self.root / "none"), "CLAUDE_MEM_WORKER_HOST": "", "CLAUDE_MEM_WORKER_PORT": ""}

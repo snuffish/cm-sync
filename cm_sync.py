@@ -102,6 +102,10 @@ WORK_STATE_COLUMNS = {
     "synced_at", "origin_device_id", "origin_local_id", "sync_rev",
 }
 
+# claude-mem's My Rules: rules are work-state tasks in this list; MY-RULES.md holds the "on" ones these set
+RULES_LIST = "my-rules"
+RULES_ACTIVE_BY = ("owner", "approved")
+
 QUIET = False
 WINDOWS = os.name == "nt"
 
@@ -117,6 +121,7 @@ STEPS = {
     "Deleted": ("✗", "yellow"),
     "Exported": ("↑", "magenta"),
     "Published": ("↑", "green"),
+    "Rules": ("↻", "green"),
 }
 
 
@@ -168,6 +173,8 @@ class Config:
         self.settings_path = self.data_dir / "settings.json"
         self.settings = read_json(self.settings_path, {})
         self.db_path = self.data_dir / "claude-mem.db"
+        self.rules_path = self.data_dir / "MY-RULES.md"
+        self.claude_md = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude") / "CLAUDE.md"
 
         host = self.setting("CLAUDE_MEM_WORKER_HOST") or "127.0.0.1"
         if host == "localhost":
@@ -316,6 +323,16 @@ class Worker:
 
     def restart(self):
         self._request("POST", "/api/admin/restart", {})
+
+    def load_rules(self):
+        """Have the worker rewrite MY-RULES.md and load it in CLAUDE.md; None when claude-mem predates 15.1."""
+        route = "/api/work-view/rules/load-in-claude-code"
+        status, body = self._request("POST", route, {})
+        if status == 404:
+            return None
+        if status != 200:
+            raise CmSyncError(f"POST {route} failed ({status}): {body}")
+        return True
 
 
 DELETE_ROUTES = {"observations": "observation", "summaries": "summary", "prompts": "prompt"}
@@ -671,7 +688,63 @@ def import_all(cfg, state, worker, full=False):
             step("Deleted", f"{totals['deleted']} rows deleted on other devices")
 
     state.save()
+    # Every import, not only when rule rows arrive: rows imported before cm-sync rebuilt rules never arrive again
+    rebuild_rules(cfg, worker)
     return totals
+
+
+def rules_loaded(cfg):
+    """True when CLAUDE.md imports MY-RULES.md, written the way claude-mem writes the line."""
+    try:
+        lines = cfg.claude_md.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return bool({line.strip() for line in lines} & {"@" + tilde(cfg.rules_path), "@" + str(cfg.rules_path)})
+
+
+def rule_counts(db_path):
+    """(active, total) My Rules, folded like claude-mem: each rule's fields from its entries, oldest first."""
+    con = connect_ro(db_path)
+    try:
+        rows = con.execute(
+            "SELECT fields FROM work_state_entries WHERE list_name = ? ORDER BY created_at_epoch, "
+            "COALESCE(origin_device_id, ''), COALESCE(CAST(origin_local_id AS INTEGER), id)", (RULES_LIST,)).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        con.close()
+    rules = {}
+    for row in rows:
+        fields = json.loads(row["fields"])
+        task = str(fields.get("task") or "")
+        if not task.startswith("Rule: "):
+            continue
+        rule = rules.setdefault(task, {})
+        for key, value in fields.items():
+            if value is None:
+                rule.pop(key, None)
+            else:
+                rule[key] = value
+    active = sum(r.get("status") == "on" and r.get("set_by") in RULES_ACTIVE_BY for r in rules.values())
+    return active, len(rules)
+
+
+def rebuild_rules(cfg, worker):
+    """Rewrite MY-RULES.md through the worker: it rebuilds the file only for rules its own cloud sync applies."""
+    if not rules_loaded(cfg):
+        counts = rule_counts(cfg.db_path) if cfg.db_path.exists() else None
+        if counts and counts[0]:
+            info(paint(f"  My Rules aren't loaded in {tilde(cfg.claude_md)}, run `cm-sync setup`", "dim"))
+        return
+    try:
+        rebuilt = worker.load_rules()
+    except CmSyncError as e:
+        warn(f"cm-sync: My Rules not rebuilt ({e})")
+        return
+    if rebuilt is None:
+        warn("cm-sync: My Rules not rebuilt, the worker needs claude-mem 15.1+")
+        return
+    step("Rules", "rebuilt " + tilde(cfg.rules_path))
 
 
 def connect_rw(db_path):
@@ -926,6 +999,13 @@ def setup(cfg, state, worker, assume_yes=False):
                 print("   restarted the worker")
     report(cfg.redaction_enabled, "claude-mem secret redaction on", "rerun `cm-sync setup` and accept, or export with --allow-unredacted")
 
+    if health and not rules_loaded(cfg) and ask(
+            f"Load My Rules ({tilde(cfg.rules_path)}) in {tilde(cfg.claude_md)}?", default=True, assume_yes=assume_yes):
+        if worker.load_rules() is None:
+            print("   the worker needs claude-mem 15.1+")
+    report(rules_loaded(cfg), f"My Rules loaded in {tilde(cfg.claude_md)}",
+           "rerun `cm-sync setup` and accept (needs claude-mem 15.1+)", level="⚠️")
+
     cloud = worker.sync_status() if health else None
     report(not (cloud or {}).get("configured"), "cmem.ai cloud sync not configured (don't combine it with cm-sync)",
            "disconnect cloud sync, or don't use cm-sync on this machine", level="⚠️")
@@ -965,6 +1045,10 @@ def status(cfg, state, worker):
     if cfg.db_path.exists():
         local = read_local(cfg.db_path)
         row("Local", counted(*((len(local[k]), k) for k in KINDS)))
+        rules = rule_counts(cfg.db_path)
+        if rules is not None:
+            loaded = "" if rules_loaded(cfg) else "  " + paint("not loaded in Claude Code", "yellow")
+            row("Rules", f"{paint(rules[0], 'bold')} active ({rules[1]} total) → {tilde(cfg.rules_path)}{loaded}")
 
     device = state.device
     print()

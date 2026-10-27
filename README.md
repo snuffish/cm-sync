@@ -18,7 +18,7 @@ The memory repo defaults to `~/.claude-memory`. If it doesn't exist yet, `cm-syn
 On a new machine:
 
 ```bash
-cm-sync setup   # checks bun/node/git, the plugin and worker, clones the memory repo, turns on redaction, names the device
+cm-sync setup   # checks bun/node/git, the plugin and worker, clones the memory repo, turns on redaction, loads My Rules, names the device
 cm-sync         # same as `cm-sync sync`
 ```
 
@@ -29,7 +29,7 @@ cm-sync         # same as `cm-sync sync`
 | `cm-sync` / `cm-sync sync`              | Pull → import → export → commit only this device's folder → push (sync is the default command)                                                  |
 | `cm-sync import`                        | Pull the memory repo, then import other devices' rows and apply their deletions (`--no-pull` to skip the pull, `--full` after a database reset) |
 | `cm-sync export`                        | Write this device's rows to `claude-mem/devices/<device-id>/` (`--with-prompts` to include raw prompts)                                         |
-| `cm-sync status`                        | Worker, redaction, counts per device, last push                                                                                                 |
+| `cm-sync status`                        | Worker, redaction, active My Rules, counts per device, last push                                                                                |
 | `cm-sync url`                           | Print the worker URL (`CLAUDE_MEM_WORKER_HOST`/`PORT` from env, then settings, then `127.0.0.1:37700 + uid % 100`, `37777` on Windows)          |
 | `cm-sync hooks`                         | Print Claude Code hooks that import on session start and sync on session end                                                                    |
 | `cm-sync refile <session-id> <project>` | Move a session's observations and summaries to another project (claude-mem files a session under the folder it started in)                      |
@@ -37,6 +37,7 @@ cm-sync         # same as `cm-sync sync`
 ## How it works
 
 - Work state (the lists behind claude-mem's "My Work" page) syncs too. No worker route keeps its timestamps, and claude-mem decides each task's current status by the latest timestamp, so cm-sync inserts other devices' entries into `work_state_entries` directly, the way claude-mem's own cloud sync does: original `created_at_epoch`, plus `origin_device_id`/`origin_local_id` so re-imports are no-ops and imported entries are never published again. It needs claude-mem v15+, and is skipped with a warning on older versions. The tool calls that link a list to the request it came from don't sync, so on other devices the lists can show under "work records need a linked human request" rather than as cards. Pick "All projects" and a wide enough time range to see older entries.
+- My Rules sync with work state: rules you set, approve, edit, turn off or dismiss are work-state entries (list `my-rules`). claude-mem rebuilds `~/.claude-mem/MY-RULES.md` only for rules its own cloud sync applies, so after every import cm-sync asks the worker to rebuild it (`POST /api/work-view/rules/load-in-claude-code`, claude-mem 15.1+). It does that only once `~/.claude/CLAUDE.md` loads the file; `cm-sync setup` offers to add that line, so run it once on each device. Suggestions waiting for review (`~/.claude-mem/work-view/story.json`) stay on the device that learned them.
 - Deleting a row on the device that created it publishes a tombstone, and the other devices delete their copy on the next import.
 - Export refuses to run while claude-mem redaction is off and skips `sensitive` observations. When a row looks like a secret it asks whether to delete it, otherwise it aborts (`--exclude-flagged` keeps those rows local instead).
 - Only this device's folder is staged and committed, so other files in the memory repo are never touched.
