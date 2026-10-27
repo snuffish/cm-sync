@@ -103,6 +103,7 @@ class Env:
         cfg.settings = json.loads(cfg.settings_path.read_text())
         cfg.worker_url = self.worker_url
         cfg.rules_path, cfg.claude_md = self.dir / "MY-RULES.md", self.dir / "CLAUDE.md"
+        cfg.work_view_dir = self.dir / "work-view"
         self.cfg = cfg
         self.state = cm.State(cfg)
         self.worker = cm.Worker(self.worker_url)
@@ -509,6 +510,117 @@ class CmSyncTests(unittest.TestCase):
             self.assertEqual(cm.paint("x", "bold", stream=pipe), "x")
         with mock.patch.dict(os.environ, {"TERM": "xterm-256color", "NO_COLOR": "1"}, clear=True):
             self.assertEqual(cm.paint("x", "bold", stream=tty), "x")
+
+    def test_work_view_export_copies_ledger_to_device_dir(self):
+        wv = self.a.cfg.work_view_dir
+        wv.mkdir(parents=True)
+        (wv / "story.json").write_text(json.dumps({"narrative": "Hello", "preferences": [{"preference": "Rule 1", "timesSeen": 1}], "writtenAt": "2026-10-25T10:00:00Z"}))
+        (wv / "request-groups.json").write_text(json.dumps({"groups": {"g_1": {"title": "Group 1"}}, "conversations": {}, "updatedAt": "2026-10-25T10:00:00Z"}))
+        (wv / "alignment.json").write_text(json.dumps({"alignedAt": "2026-10-25T10:00:00Z", "goals": []}))
+        (wv / "progress").mkdir()
+        (wv / "progress" / "g_1.json").write_text(json.dumps({"groupId": "g_1", "percent": 50, "checkedAt": "2026-10-25T10:00:00Z"}))
+
+        self.a.export()
+
+        out_wv = self.a.device_dir() / "work-view"
+        self.assertTrue((out_wv / "story.json").is_file())
+        self.assertTrue((out_wv / "request-groups.json").is_file())
+        self.assertTrue((out_wv / "alignment.json").is_file())
+        self.assertTrue((out_wv / "progress" / "g_1.json").is_file())
+
+        story = cm.read_json(out_wv / "story.json", {})
+        self.assertEqual(story["narrative"], "Hello")
+        self.assertEqual(story["preferences"][0]["preference"], "Rule 1")
+
+        prog = cm.read_json(out_wv / "progress" / "g_1.json", {})
+        self.assertEqual(prog["percent"], 50)
+
+    def test_work_view_import_merges_progress_and_groups(self):
+        wv_a = self.a.cfg.work_view_dir
+        wv_a.mkdir(parents=True)
+        (wv_a / "progress").mkdir()
+        (wv_a / "progress" / "g_1.json").write_text(json.dumps({"groupId": "g_1", "percent": 50, "checkedAt": "2026-10-25T10:00:00Z"}))
+        (wv_a / "progress" / "g_2.json").write_text(json.dumps({"groupId": "g_2", "percent": 20, "checkedAt": "2026-10-25T11:00:00Z"}))
+        (wv_a / "request-groups.json").write_text(json.dumps({
+            "groups": {"g_1": {"title": "Group 1", "updatedAt": "2026-10-25T10:00:00Z"}},
+            "conversations": {"c_1": {"title": "Conv 1"}},
+            "updatedAt": "2026-10-25T10:00:00Z",
+        }))
+        (wv_a / "alignment.json").write_text(json.dumps({"alignedAt": "2026-10-25T10:00:00Z", "version": 1}))
+
+        wv_b = self.b.cfg.work_view_dir
+        wv_b.mkdir(parents=True)
+        (wv_b / "progress").mkdir()
+        (wv_b / "progress" / "g_1.json").write_text(json.dumps({"groupId": "g_1", "percent": 80, "checkedAt": "2026-10-25T12:00:00Z"}))
+        (wv_b / "request-groups.json").write_text(json.dumps({
+            "groups": {"g_3": {"title": "Group 3", "updatedAt": "2026-10-25T12:00:00Z"}},
+            "conversations": {"c_2": {"title": "Conv 2"}},
+            "updatedAt": "2026-10-25T12:00:00Z",
+        }))
+        (wv_b / "alignment.json").write_text(json.dumps({"alignedAt": "2026-10-25T12:00:00Z", "version": 2}))
+
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+
+        # On Device B:
+        # g_1 was newer on B (80% vs 50%)
+        g_1 = cm.read_json(wv_b / "progress" / "g_1.json", {})
+        self.assertEqual(g_1["percent"], 80)
+
+        # g_2 was imported from A
+        g_2 = cm.read_json(wv_b / "progress" / "g_2.json", {})
+        self.assertEqual(g_2["percent"], 20)
+
+        # request-groups unioned groups (g_1 and g_3) and conversations (c_1 and c_2)
+        rg = cm.read_json(wv_b / "request-groups.json", {})
+        self.assertIn("g_1", rg["groups"])
+        self.assertIn("g_3", rg["groups"])
+        self.assertIn("c_1", rg["conversations"])
+        self.assertIn("c_2", rg["conversations"])
+
+        # alignment took the newer one (alignedAt 12:00:00Z)
+        al = cm.read_json(wv_b / "alignment.json", {})
+        self.assertEqual(al["version"], 2)
+
+    def test_work_view_import_unions_preferences_and_prunes_decided_rules(self):
+        wv_a = self.a.cfg.work_view_dir
+        wv_a.mkdir(parents=True)
+        (wv_a / "story.json").write_text(json.dumps({
+            "narrative": "Story A",
+            "writtenAt": "2026-10-25T10:00:00Z",
+            "preferences": [
+                {"preference": "P1", "timesSeen": 2},
+                {"preference": "P2", "timesSeen": 1},
+            ],
+        }))
+
+        self.a.export()
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+
+        wv_b = self.b.cfg.work_view_dir
+        story_b = cm.read_json(wv_b / "story.json", {})
+        pref_texts = [p["preference"] for p in story_b.get("preferences", [])]
+        self.assertEqual(pref_texts, ["P1", "P2"])
+
+        # Device B approves P1
+        p1_id = cm.pref_rule_id("P1")
+        self.b.add_work_state({"task": f"Rule: {p1_id}", "rule_id": p1_id, "status": "on"}, epoch=200, list_name="my-rules")
+
+        # Re-import; verify P1 is pruned
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        story_b = cm.read_json(wv_b / "story.json", {})
+        pref_texts = [p["preference"] for p in story_b.get("preferences", [])]
+        self.assertEqual(pref_texts, ["P2"])
+
+        # Device B dismisses P2
+        p2_id = cm.pref_rule_id("P2")
+        self.b.add_work_state({"task": f"Rule: {p2_id}", "rule_id": p2_id, "status": "dismissed"}, epoch=300, list_name="my-rules")
+
+        # Re-import; verify P2 is also pruned
+        cm.import_all(self.b.cfg, self.b.state, self.b.worker)
+        story_b = cm.read_json(wv_b / "story.json", {})
+        pref_texts = [p["preference"] for p in story_b.get("preferences", [])]
+        self.assertEqual(pref_texts, [])
 
 
 if __name__ == "__main__":

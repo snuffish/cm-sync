@@ -174,6 +174,7 @@ class Config:
         self.settings = read_json(self.settings_path, {})
         self.db_path = self.data_dir / "claude-mem.db"
         self.rules_path = self.data_dir / "MY-RULES.md"
+        self.work_view_dir = self.data_dir / "work-view"
         self.claude_md = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude") / "CLAUDE.md"
 
         host = self.setting("CLAUDE_MEM_WORKER_HOST") or "127.0.0.1"
@@ -445,6 +446,77 @@ def jsonl(rows):
     return "".join(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for r in rows)
 
 
+def pref_rule_id(preference):
+    return "pref_" + hashlib.sha256(str(preference).encode("utf-8")).hexdigest()[:12]
+
+
+def resolved_rule_ids(db_path):
+    """Set of rule IDs whose latest status in work_state_entries is on, off, dismissed, or replaced."""
+    if not db_path or not Path(db_path).exists():
+        return set()
+    con = connect_ro(Path(db_path))
+    try:
+        rows = con.execute(
+            "SELECT fields FROM work_state_entries WHERE list_name = ? ORDER BY created_at_epoch, "
+            "COALESCE(origin_device_id, ''), COALESCE(CAST(origin_local_id AS INTEGER), id)", (RULES_LIST,)).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        con.close()
+    rules = {}
+    for row in rows:
+        fields = json.loads(row["fields"])
+        task = str(fields.get("task") or "")
+        rule_id = fields.get("rule_id")
+        if not rule_id and task.startswith("Rule: "):
+            rule_id = task[len("Rule: "):].strip()
+        if not rule_id:
+            continue
+        rule = rules.setdefault(rule_id, {})
+        for key, value in fields.items():
+            if value is None:
+                rule.pop(key, None)
+            else:
+                rule[key] = value
+    return {rule_id for rule_id, fields in rules.items() if fields.get("status") in ("on", "off", "dismissed", "replaced")}
+
+
+def export_work_view(cfg, out_dir, db_path):
+    wv_dir = cfg.work_view_dir
+    if not wv_dir or not wv_dir.is_dir():
+        return
+    dest_wv = out_dir / "work-view"
+
+    story_path = wv_dir / "story.json"
+    if story_path.is_file():
+        story = read_json(story_path, {})
+        resolved = resolved_rule_ids(db_path)
+        if "preferences" in story and isinstance(story["preferences"], list):
+            story["preferences"] = [
+                p for p in story["preferences"]
+                if pref_rule_id(p.get("preference", "")) not in resolved
+            ]
+        write_if_changed(dest_wv / "story.json", json.dumps(story, indent=2, sort_keys=True) + "\n")
+
+    rg_path = wv_dir / "request-groups.json"
+    if rg_path.is_file():
+        rg = read_json(rg_path, {})
+        write_if_changed(dest_wv / "request-groups.json", json.dumps(rg, indent=2, sort_keys=True) + "\n")
+
+    al_path = wv_dir / "alignment.json"
+    if al_path.is_file():
+        al = read_json(al_path, {})
+        write_if_changed(dest_wv / "alignment.json", json.dumps(al, indent=2, sort_keys=True) + "\n")
+
+    prog_dir = wv_dir / "progress"
+    if prog_dir.is_dir():
+        dest_prog = dest_wv / "progress"
+        for p in sorted(prog_dir.glob("g_*.json")):
+            if p.is_file():
+                data = read_json(p, {})
+                write_if_changed(dest_prog / p.name, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
 def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, exclude_flagged=False):
     device = state.require_device()
     if not cfg.redaction_enabled and not allow_unredacted:
@@ -537,6 +609,8 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
     if new_tombstones:
         write_text_atomic(out / "tombstones.jsonl", jsonl(old_tombstones + new_tombstones))
 
+    export_work_view(cfg, out, cfg.db_path)
+
     version = (worker.health() or {}).get("version") if worker else None
     manifest = {
         "format": FORMAT,
@@ -614,6 +688,118 @@ def batches(rows_by_kind, sessions, limit=BATCH_BYTES):
         yield payload, keys
 
 
+def import_work_view(cfg, state, db_path, other_device_dirs):
+    wv_dir = cfg.work_view_dir
+    if not wv_dir:
+        return
+    other_wv_dirs = [d / "work-view" for d in other_device_dirs if (d / "work-view").is_dir()]
+    if not other_wv_dirs:
+        return
+
+    # 1. progress/
+    prog_names = set()
+    local_prog_dir = wv_dir / "progress"
+    if local_prog_dir.is_dir():
+        for p in local_prog_dir.glob("g_*.json"):
+            prog_names.add(p.name)
+    for d in other_wv_dirs:
+        prog_d = d / "progress"
+        if prog_d.is_dir():
+            for p in prog_d.glob("g_*.json"):
+                prog_names.add(p.name)
+
+    if prog_names:
+        dest_prog_dir = wv_dir / "progress"
+        for name in sorted(prog_names):
+            candidates = []
+            if (dest_prog_dir / name).is_file():
+                candidates.append(read_json(dest_prog_dir / name, {}))
+            for d in other_wv_dirs:
+                if (d / "progress" / name).is_file():
+                    candidates.append(read_json(d / "progress" / name, {}))
+            if candidates:
+                best = max(candidates, key=lambda x: str(x.get("checkedAt") or x.get("changedAt") or x.get("lastActivityAt") or ""))
+                write_if_changed(dest_prog_dir / name, json.dumps(best, indent=2, sort_keys=True) + "\n")
+
+    # 2. request-groups.json
+    rg_candidates = []
+    if (wv_dir / "request-groups.json").is_file():
+        rg_candidates.append(read_json(wv_dir / "request-groups.json", {}))
+    for d in other_wv_dirs:
+        if (d / "request-groups.json").is_file():
+            rg_candidates.append(read_json(d / "request-groups.json", {}))
+    if rg_candidates:
+        best_rg = max(rg_candidates, key=lambda r: str(r.get("updatedAt") or ""))
+        merged_rg = dict(best_rg)
+        merged_groups = {}
+        merged_convs = {}
+        merged_ignored = dict(best_rg.get("ignored", {})) if isinstance(best_rg.get("ignored"), dict) else []
+        for cand in rg_candidates:
+            for gid, g in (cand.get("groups") or {}).items():
+                if gid not in merged_groups:
+                    merged_groups[gid] = g
+                else:
+                    t1 = str(merged_groups[gid].get("decidedAt") or merged_groups[gid].get("updatedAt") or "")
+                    t2 = str(g.get("decidedAt") or g.get("updatedAt") or "")
+                    if t2 > t1:
+                        merged_groups[gid] = g
+            for cid, c in (cand.get("conversations") or {}).items():
+                merged_convs[cid] = c
+            if isinstance(merged_ignored, dict) and isinstance(cand.get("ignored"), dict):
+                merged_ignored.update(cand["ignored"])
+            elif isinstance(merged_ignored, list) and isinstance(cand.get("ignored"), list):
+                for x in cand["ignored"]:
+                    if x not in merged_ignored:
+                        merged_ignored.append(x)
+        merged_rg["groups"] = merged_groups
+        merged_rg["conversations"] = merged_convs
+        merged_rg["ignored"] = merged_ignored
+        max_up = max((str(c.get("updatedAt") or "") for c in rg_candidates), default="")
+        if max_up:
+            merged_rg["updatedAt"] = max_up
+        write_if_changed(wv_dir / "request-groups.json", json.dumps(merged_rg, indent=2, sort_keys=True) + "\n")
+
+    # 3. alignment.json
+    al_candidates = []
+    if (wv_dir / "alignment.json").is_file():
+        al_candidates.append(read_json(wv_dir / "alignment.json", {}))
+    for d in other_wv_dirs:
+        if (d / "alignment.json").is_file():
+            al_candidates.append(read_json(d / "alignment.json", {}))
+    if al_candidates:
+        best_al = max(al_candidates, key=lambda a: str(a.get("alignedAt") or ""))
+        write_if_changed(wv_dir / "alignment.json", json.dumps(best_al, indent=2, sort_keys=True) + "\n")
+
+    # 4. story.json
+    story_candidates = []
+    if (wv_dir / "story.json").is_file():
+        story_candidates.append(read_json(wv_dir / "story.json", {}))
+    for d in other_wv_dirs:
+        if (d / "story.json").is_file():
+            story_candidates.append(read_json(d / "story.json", {}))
+    if story_candidates:
+        best_story = dict(max(story_candidates, key=lambda s: str(s.get("writtenAt") or "")))
+        seen_prefs = {}
+        for cand in story_candidates:
+            for p in (cand.get("preferences") or []):
+                text = p.get("preference")
+                if not text:
+                    continue
+                if text not in seen_prefs:
+                    seen_prefs[text] = p
+                else:
+                    if (p.get("timesSeen") or 0) > (seen_prefs[text].get("timesSeen") or 0):
+                        seen_prefs[text] = p
+        resolved = resolved_rule_ids(db_path)
+        filtered = [
+            p for text, p in seen_prefs.items()
+            if pref_rule_id(text) not in resolved
+        ]
+        filtered.sort(key=lambda p: (-(p.get("timesSeen") or 0), p.get("preference", "")))
+        best_story["preferences"] = filtered
+        write_if_changed(wv_dir / "story.json", json.dumps(best_story, indent=2, sort_keys=True) + "\n")
+
+
 def import_all(cfg, state, worker, full=False):
     device = state.require_device()
     worker.require_health()
@@ -688,6 +874,7 @@ def import_all(cfg, state, worker, full=False):
             step("Deleted", f"{totals['deleted']} rows deleted on other devices")
 
     state.save()
+    import_work_view(cfg, state, cfg.db_path, devices)
     # Every import, not only when rule rows arrive: rows imported before cm-sync rebuilt rules never arrive again
     rebuild_rules(cfg, worker)
     return totals
@@ -1052,6 +1239,18 @@ def status(cfg, state, worker):
         if rules is not None:
             loaded = "" if rules_loaded(cfg) else "  " + paint("not loaded in Claude Code", "yellow")
             row("Rules", f"{paint(rules[0], 'bold')} active ({rules[1]} total) → {tilde(cfg.rules_path)}{loaded}")
+        wv_dir = cfg.work_view_dir
+        if wv_dir and wv_dir.is_dir():
+            story_file = wv_dir / "story.json"
+            pending_rules = 0
+            if story_file.is_file():
+                resolved = resolved_rule_ids(cfg.db_path)
+                story_data = read_json(story_file, {})
+                prefs = story_data.get("preferences") or []
+                pending_rules = sum(1 for p in prefs if pref_rule_id(p.get("preference", "")) not in resolved)
+            prog_dir = wv_dir / "progress"
+            prog_count = len(list(prog_dir.glob("g_*.json"))) if prog_dir.is_dir() else 0
+            row("Work-view", f"{paint(pending_rules, 'bold')} pending rule decisions, {paint(prog_count, 'bold')} progress groups")
 
     device = state.device
     print()
