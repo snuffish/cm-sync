@@ -984,7 +984,10 @@ def setup(cfg, state, worker, assume_yes=False):
 
     auto_memory = claude_settings.get("autoMemoryDirectory")
     expected = tilde(cfg.repo)
-    report(bool(auto_memory) and Path(auto_memory).expanduser() == cfg.repo, f"Claude Code autoMemoryDirectory is {expected}",
+    matches = bool(auto_memory) and Path(auto_memory).expanduser() == cfg.repo
+    actual = "not set" if not auto_memory else f"is {auto_memory}"
+    report(matches, f"Claude Code autoMemoryDirectory is {expected}" if matches
+           else f"Claude Code autoMemoryDirectory {actual}, expected {expected}",
            f'set "autoMemoryDirectory": "{expected}" in ~/.claude/settings.json', level="⚠️")
 
     if not cfg.redaction_enabled and cfg.settings_path.exists() and ask(
