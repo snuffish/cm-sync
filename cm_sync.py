@@ -1085,9 +1085,11 @@ def pull(cfg):
 def run_gitleaks(path):
     if not shutil.which("gitleaks"):
         return
-    result = subprocess.run(["gitleaks", "dir", str(path), "--no-banner", "--redact"], capture_output=True, encoding="utf-8", errors="replace")
+    config = Path(__file__).resolve().parent / "gitleaks.toml"
+    result = subprocess.run(["gitleaks", "dir", str(path), "--config", str(config), "--no-banner", "--redact", "--verbose"], capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode == 1:
-        raise CmSyncError(f"gitleaks found possible secrets in {path}, nothing was committed:\n{result.stdout.strip()}")
+        # gitleaks prints findings on stdout (--verbose) and its summary on stderr
+        raise CmSyncError(f"gitleaks found possible secrets in {path}, nothing was committed:\n{(result.stdout + result.stderr).strip()}")
 
 
 def sync(cfg, state, worker, **export_args):

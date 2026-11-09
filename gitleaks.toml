@@ -1,0 +1,15 @@
+# Default gitleaks rules plus allowlists for cm-sync's own export format.
+[extend]
+useDefault = true
+
+# Tombstones hold only {at, key, kind}; key is a 32-hex row hash, not a credential.
+[[allowlists]]
+description = "cm-sync tombstone row hashes"
+regexTarget = "line"
+regexes = ['''^\s*\{"at":\d+,"key":"[0-9a-f]{32}","kind":"[a-z_]+"\}\s*$''']
+
+# Observation text that mentions a local port, e.g. "localhost:5034/tickerq".
+[[allowlists]]
+description = "localhost URLs in observation text"
+regexTarget = "match"
+regexes = ['''localhost:\d+''']
