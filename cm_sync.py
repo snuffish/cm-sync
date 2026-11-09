@@ -20,6 +20,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -1082,14 +1083,60 @@ def pull(cfg):
     step("Pulled", f"{paint(sha, 'yellow')} {subject}")
 
 
-def run_gitleaks(path):
+TOMBSTONE_KEY = re.compile(r"[0-9a-f]{32}")
+GITLEAKS_ALLOWED = "gitleaks-allowed.keys"
+
+
+def gitleaks_key(finding):
+    """Identify a finding by rule and secret hash, so it survives line shifts and keeps the secret off disk."""
+    digest = hashlib.sha256(finding.get("Secret", "").encode("utf-8")).hexdigest()
+    return f"{finding.get('RuleID', '')} {digest}"
+
+
+def gitleaks_findings(path):
+    config = Path(__file__).resolve().parent / "gitleaks.toml"
+    with tempfile.TemporaryDirectory(prefix="cm-sync-gitleaks-") as tmp:
+        report = Path(tmp) / "report.json"
+        result = subprocess.run(["gitleaks", "dir", str(path), "--config", str(config), "--no-banner", "--report-format", "json", "--report-path", str(report)],
+                                capture_output=True, encoding="utf-8", errors="replace")
+        if result.returncode == 0:
+            return []
+        try:
+            return json.loads(report.read_text(encoding="utf-8")) or []
+        except (OSError, ValueError):
+            raise CmSyncError(f"gitleaks failed on {path}, nothing was committed:\n{result.stderr.strip()}")
+
+
+def run_gitleaks(path, state_dir):
     if not shutil.which("gitleaks"):
         return
-    config = Path(__file__).resolve().parent / "gitleaks.toml"
-    result = subprocess.run(["gitleaks", "dir", str(path), "--config", str(config), "--no-banner", "--redact", "--verbose"], capture_output=True, encoding="utf-8", errors="replace")
-    if result.returncode == 1:
-        # gitleaks prints findings on stdout (--verbose) and its summary on stderr
-        raise CmSyncError(f"gitleaks found possible secrets in {path}, nothing was committed:\n{(result.stdout + result.stderr).strip()}")
+    allowed_file = Path(state_dir) / GITLEAKS_ALLOWED
+    try:
+        allowed = set(allowed_file.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        allowed = set()
+    # Tombstone keys are row_key() hashes that cm-sync writes itself; generic-api-key mistakes them for keys
+    findings = [f for f in gitleaks_findings(path)
+                if not (Path(f.get("File", "")).name == "tombstones.jsonl" and TOMBSTONE_KEY.fullmatch(f.get("Secret", "")))
+                and gitleaks_key(f) not in allowed]
+    if not findings:
+        return
+
+    def shown(f):
+        secret = f.get("Secret", "")
+        match = (f.get("Match") or "").replace(secret, "REDACTED") if secret else f.get("Match", "")
+        return f"  {Path(f.get('File', '')).name}:{f.get('StartLine')} {f.get('RuleID')}: {match[:80]}"
+
+    listing = f"gitleaks found possible secrets in {path}:\n" + "\n".join(shown(f) for f in findings)
+    if ask_tty(listing + f"\nThese are false positives: allow them on this device and publish?"):
+        keys = sorted(allowed | {gitleaks_key(f) for f in findings})
+        write_text_atomic(allowed_file, "".join(f"{k}\n" for k in keys))
+        info(f"Allowed {len(findings)} gitleaks findings ({tilde(allowed_file)})")
+        return
+    raise CmSyncError(
+        listing.replace(":\n", ", nothing was committed:\n", 1) +
+        "\nDelete real secrets in the claude-mem viewer. If these are false positives, run `cm-sync sync` in a terminal and allow them."
+    )
 
 
 def sync(cfg, state, worker, **export_args):
@@ -1099,7 +1146,7 @@ def sync(cfg, state, worker, **export_args):
     result = export(cfg, state, worker, **export_args)
 
     rel = (DEVICES_DIR / device["id"]).as_posix()
-    run_gitleaks(cfg.repo / rel)
+    run_gitleaks(cfg.repo / rel, cfg.state_dir)
     git(cfg, "add", "--", rel)
     if not git(cfg, "status", "--porcelain", "--", rel).stdout.strip():
         step("Published", paint("nothing new", "dim"))

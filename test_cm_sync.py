@@ -283,6 +283,36 @@ class CmSyncTests(unittest.TestCase):
             with self.assertRaises(cm.CmSyncError):
                 cm.export(self.a.cfg, self.a.state, worker)
 
+    def test_gitleaks_skips_tombstones_and_remembers_allowed_findings(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        out, state_dir = tmp / "device", tmp / "state"
+        state_dir.mkdir()
+        findings = [
+            {"RuleID": "generic-api-key", "File": str(out / "tombstones.jsonl"), "StartLine": 1,
+             "Secret": "75c24ef67b437c5faeefc63517ffa027", "Match": 'key":"75c24ef67b437c5faeefc63517ffa027"'},
+            {"RuleID": "generic-api-key", "File": str(out / "observations.jsonl"), "StartLine": 9,
+             "Secret": "recent-items-v1", "Match": "STORAGE_KEY = 'recent-items-v1'"},
+        ]
+
+        def fake_run(cmd, **_):
+            Path(cmd[cmd.index("--report-path") + 1]).write_text(json.dumps(findings))
+            return subprocess.CompletedProcess(cmd, 1, "", "leaks found")
+
+        with mock.patch.object(cm.shutil, "which", return_value="/usr/bin/gitleaks"), \
+                mock.patch.object(cm.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(cm, "ask_tty", return_value=False) as prompt, self.assertRaises(cm.CmSyncError) as err:
+                cm.run_gitleaks(out, state_dir)
+            self.assertIn("observations.jsonl:9", str(err.exception))
+            self.assertNotIn("tombstones", str(err.exception))
+            self.assertNotIn("recent-items-v1", prompt.call_args[0][0])
+            with mock.patch.object(cm, "ask_tty", return_value=True):
+                cm.run_gitleaks(out, state_dir)
+            self.assertNotIn("recent-items-v1", (state_dir / cm.GITLEAKS_ALLOWED).read_text())
+            with mock.patch.object(cm, "ask_tty") as prompt:
+                cm.run_gitleaks(out, state_dir)
+            prompt.assert_not_called()
+
     def test_export_refuses_without_redaction(self):
         self.a.cfg.settings["CLAUDE_MEM_REDACT_ENABLED"] = "false"
         with self.assertRaises(cm.CmSyncError):
