@@ -27,7 +27,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-FORMAT = 1
+FORMAT = 2
+WORK_VIEW_LOG = "work-view.jsonl"
 BATCH_BYTES = 4 * 1024 * 1024
 DEVICES_DIR = Path("claude-mem") / "devices"
 LEGACY_EXPORT_DIR = Path("claude-mem") / "macbook-pro"
@@ -123,6 +124,7 @@ STEPS = {
     "Exported": ("↑", "magenta"),
     "Published": ("↑", "green"),
     "Rules": ("↻", "green"),
+    "Notes": ("✎", "yellow"),
 }
 
 
@@ -447,6 +449,40 @@ def jsonl(rows):
     return "".join(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for r in rows)
 
 
+def append_text(path, text):
+    """Add lines to the end of a published file; published lines are never rewritten."""
+    if not text:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_newline = False
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell():
+                f.seek(-1, os.SEEK_END)
+                needs_newline = f.read(1) != b"\n"
+    except OSError:
+        pass
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        f.write(("\n" if needs_newline else "") + text)
+
+
+def fold_jsonl(path, kind, dead=frozenset()):
+    """Published files keep every version of a row: the last line per key wins and tombstoned keys drop out."""
+    rows = {}
+    for row in read_jsonl(path):
+        rows[row_key(kind, row)] = row
+    return {k: r for k, r in rows.items() if k not in dead}
+
+
+def tombstone_keys(device_path):
+    return {t["key"] for t in read_jsonl(device_path / "tombstones.jsonl")}
+
+
+def live_rows(device_path, kind):
+    return fold_jsonl(device_path / f"{kind}.jsonl", kind, tombstone_keys(device_path))
+
+
 def pref_rule_id(preference):
     return "pref_" + hashlib.sha256(str(preference).encode("utf-8")).hexdigest()[:12]
 
@@ -482,44 +518,97 @@ def resolved_rule_ids(db_path):
     return {rule_id for rule_id, fields in rules.items() if fields.get("status") in ("on", "off", "dismissed", "replaced")}
 
 
+def work_view_entities(wv_dir, resolved=frozenset()):
+    """Flatten claude-mem's work-view ledger into {(kind, id): data}: one entity per line of the append log."""
+    out = {}
+    wv_dir = Path(wv_dir)
+    if (wv_dir / "story.json").is_file():
+        story = dict(read_json(wv_dir / "story.json", {}))
+        prefs = story.get("preferences")
+        if isinstance(prefs, list):
+            del story["preferences"]
+            for p in prefs:
+                rule_id = pref_rule_id(p.get("preference", ""))
+                if rule_id not in resolved:
+                    out[("preference", rule_id)] = p
+        out[("story", "story")] = story
+    if (wv_dir / "request-groups.json").is_file():
+        rg = read_json(wv_dir / "request-groups.json", {})
+        out[("rg", "meta")] = {k: v for k, v in rg.items() if k not in ("groups", "conversations", "ignored")}
+        for gid, g in (rg.get("groups") or {}).items():
+            out[("group", gid)] = g
+        for cid, c in (rg.get("conversations") or {}).items():
+            out[("conversation", cid)] = c
+        if "ignored" in rg:
+            out[("ignored", "ignored")] = rg["ignored"]
+    if (wv_dir / "alignment.json").is_file():
+        out[("alignment", "alignment")] = read_json(wv_dir / "alignment.json", {})
+    if (wv_dir / "progress").is_dir():
+        for p in sorted((wv_dir / "progress").glob("g_*.json")):
+            if p.is_file():
+                out[("progress", p.name)] = read_json(p, {})
+    return out
+
+
+def fold_entities(path):
+    """Latest data per (kind, id) of a work-view log; a null data line removes the entity."""
+    ents = {}
+    for row in read_jsonl(path):
+        key = (row["kind"], row["id"])
+        if row.get("data") is None:
+            ents.pop(key, None)
+        else:
+            ents[key] = row["data"]
+    return ents
+
+
+def work_view_from_entities(ents):
+    view = {"progress": {i: d for (k, i), d in ents.items() if k == "progress"}}
+    if ("rg", "meta") in ents:
+        rg = dict(ents[("rg", "meta")])
+        rg["groups"] = {i: d for (k, i), d in ents.items() if k == "group"}
+        rg["conversations"] = {i: d for (k, i), d in ents.items() if k == "conversation"}
+        if ("ignored", "ignored") in ents:
+            rg["ignored"] = ents[("ignored", "ignored")]
+        view["request_groups"] = rg
+    if ("alignment", "alignment") in ents:
+        view["alignment"] = ents[("alignment", "alignment")]
+    if ("story", "story") in ents:
+        story = dict(ents[("story", "story")])
+        story["preferences"] = [d for (k, _), d in ents.items() if k == "preference"]
+        view["story"] = story
+    return view
+
+
+def device_work_view(device_path):
+    """Another device's work-view: its append log, else the snapshot folder older cm-sync versions wrote."""
+    if (device_path / WORK_VIEW_LOG).is_file():
+        return work_view_from_entities(fold_entities(device_path / WORK_VIEW_LOG))
+    if (device_path / "work-view").is_dir():
+        return work_view_from_entities(work_view_entities(device_path / "work-view"))
+    return None
+
+
 def export_work_view(cfg, out_dir, db_path):
+    """Append the entities that changed since the last export; returns the number of lines added."""
     wv_dir = cfg.work_view_dir
     if not wv_dir or not wv_dir.is_dir():
-        return
-    dest_wv = out_dir / "work-view"
-
-    story_path = wv_dir / "story.json"
-    if story_path.is_file():
-        story = read_json(story_path, {})
-        resolved = resolved_rule_ids(db_path)
-        if "preferences" in story and isinstance(story["preferences"], list):
-            story["preferences"] = [
-                p for p in story["preferences"]
-                if pref_rule_id(p.get("preference", "")) not in resolved
-            ]
-        write_if_changed(dest_wv / "story.json", json.dumps(story, indent=2, sort_keys=True) + "\n")
-
-    rg_path = wv_dir / "request-groups.json"
-    if rg_path.is_file():
-        rg = read_json(rg_path, {})
-        write_if_changed(dest_wv / "request-groups.json", json.dumps(rg, indent=2, sort_keys=True) + "\n")
-
-    al_path = wv_dir / "alignment.json"
-    if al_path.is_file():
-        al = read_json(al_path, {})
-        write_if_changed(dest_wv / "alignment.json", json.dumps(al, indent=2, sort_keys=True) + "\n")
-
-    prog_dir = wv_dir / "progress"
-    if prog_dir.is_dir():
-        dest_prog = dest_wv / "progress"
-        for p in sorted(prog_dir.glob("g_*.json")):
-            if p.is_file():
-                data = read_json(p, {})
-                write_if_changed(dest_prog / p.name, json.dumps(data, indent=2, sort_keys=True) + "\n")
+        return 0
+    current = work_view_entities(wv_dir, resolved_rule_ids(db_path))
+    path = out_dir / WORK_VIEW_LOG
+    have = fold_entities(path)
+    now = int(time.time())
+    rows = [{"at": now, "data": data, "id": i, "kind": k} for (k, i), data in sorted(current.items()) if have.get((k, i)) != data]
+    rows += [{"at": now, "data": None, "id": i, "kind": k} for (k, i) in sorted(have) if (k, i) not in current]
+    append_text(path, jsonl(rows))
+    return len(rows)
 
 
 def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, exclude_flagged=False):
     device = state.require_device()
+    own_format = read_json(device_dir(cfg, device["id"]) / "manifest.json", {}).get("format", 1)
+    if own_format > FORMAT:
+        raise CmSyncError(f"this device's folder is format {own_format}, newer than this cm-sync ({FORMAT}): update cm-sync")
     if not cfg.redaction_enabled and not allow_unredacted:
         raise CmSyncError(
             "claude-mem redaction is off (CLAUDE_MEM_REDACT_ENABLED), so secrets may be in your memory.\n"
@@ -600,17 +689,17 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
                       for key, kind in sorted(state.exported.items())
                       if key not in all_present and key not in known]
 
+    dead = known | {t["key"] for t in new_tombstones}
+    appended, live = {}, {}
     for kind in KINDS:
         path = out / f"{kind}.jsonl"
-        if kind == "prompts" and not with_prompts:
-            if path.exists():
-                path.unlink()
-            continue
-        write_if_changed(path, jsonl(row for _, row in published[kind]))
-    if new_tombstones:
-        write_text_atomic(out / "tombstones.jsonl", jsonl(old_tombstones + new_tombstones))
-
-    export_work_view(cfg, out, cfg.db_path)
+        have = fold_jsonl(path, kind)
+        fresh = [] if kind == "prompts" and not with_prompts else [(k, r) for k, r in published[kind] if have.get(k) != r]
+        append_text(path, jsonl(r for _, r in fresh))
+        appended[kind] = len(fresh)
+        live[kind] = len({k for k in have.keys() | {k for k, _ in fresh} if k not in dead})
+    append_text(out / "tombstones.jsonl", jsonl(new_tombstones))
+    appended["work_view"] = export_work_view(cfg, out, cfg.db_path)
 
     version = (worker.health() or {}).get("version") if worker else None
     manifest = {
@@ -618,7 +707,7 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
         "device_id": device["id"],
         "device_name": device["name"],
         "claude_mem_version": version or read_json(out / "manifest.json", {}).get("claude_mem_version"),
-        "counts": {kind: len(published[kind]) for kind in KINDS},
+        "counts": live,
     }
     write_if_changed(out / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
@@ -629,9 +718,9 @@ def export(cfg, state, worker=None, with_prompts=False, allow_unredacted=False, 
             state.exported[key] = kind
     state.save()
 
-    step("Exported", counted(*((len(published[k]), k) for k in KINDS if k != "prompts" or with_prompts), (len(new_tombstones), "new tombstones")))
+    step("Exported", counted(*((appended[k], f"new {k}".replace("_", " ")) for k in appended if k != "prompts" or with_prompts), (len(new_tombstones), "new tombstones")))
     info(" " * 14 + paint(f"→ {tilde(out.parent)}/{device['id'][:8]}…", "dim"))
-    return {"published": {k: len(v) for k, v in published.items()}, "tombstones": len(new_tombstones)}
+    return {"published": appended, "tombstones": len(new_tombstones)}
 
 
 def write_if_changed(path, text):
@@ -693,42 +782,28 @@ def import_work_view(cfg, state, db_path, other_device_dirs):
     wv_dir = cfg.work_view_dir
     if not wv_dir:
         return
-    other_wv_dirs = [d / "work-view" for d in other_device_dirs if (d / "work-view").is_dir()]
-    if not other_wv_dirs:
+    views = [v for v in (device_work_view(d) for d in other_device_dirs) if v]
+    if not views:
         return
 
     # 1. progress/
-    prog_names = set()
     local_prog_dir = wv_dir / "progress"
-    if local_prog_dir.is_dir():
-        for p in local_prog_dir.glob("g_*.json"):
-            prog_names.add(p.name)
-    for d in other_wv_dirs:
-        prog_d = d / "progress"
-        if prog_d.is_dir():
-            for p in prog_d.glob("g_*.json"):
-                prog_names.add(p.name)
-
-    if prog_names:
-        dest_prog_dir = wv_dir / "progress"
-        for name in sorted(prog_names):
-            candidates = []
-            if (dest_prog_dir / name).is_file():
-                candidates.append(read_json(dest_prog_dir / name, {}))
-            for d in other_wv_dirs:
-                if (d / "progress" / name).is_file():
-                    candidates.append(read_json(d / "progress" / name, {}))
-            if candidates:
-                best = max(candidates, key=lambda x: str(x.get("checkedAt") or x.get("changedAt") or x.get("lastActivityAt") or ""))
-                write_if_changed(dest_prog_dir / name, json.dumps(best, indent=2, sort_keys=True) + "\n")
+    prog_names = {p.name for p in local_prog_dir.glob("g_*.json")} if local_prog_dir.is_dir() else set()
+    for v in views:
+        prog_names |= set(v["progress"])
+    for name in sorted(prog_names):
+        candidates = []
+        if (local_prog_dir / name).is_file():
+            candidates.append(read_json(local_prog_dir / name, {}))
+        candidates += [v["progress"][name] for v in views if name in v["progress"]]
+        best = max(candidates, key=lambda x: str(x.get("checkedAt") or x.get("changedAt") or x.get("lastActivityAt") or ""))
+        write_if_changed(local_prog_dir / name, json.dumps(best, indent=2, sort_keys=True) + "\n")
 
     # 2. request-groups.json
     rg_candidates = []
     if (wv_dir / "request-groups.json").is_file():
         rg_candidates.append(read_json(wv_dir / "request-groups.json", {}))
-    for d in other_wv_dirs:
-        if (d / "request-groups.json").is_file():
-            rg_candidates.append(read_json(d / "request-groups.json", {}))
+    rg_candidates += [v["request_groups"] for v in views if "request_groups" in v]
     if rg_candidates:
         best_rg = max(rg_candidates, key=lambda r: str(r.get("updatedAt") or ""))
         merged_rg = dict(best_rg)
@@ -764,9 +839,7 @@ def import_work_view(cfg, state, db_path, other_device_dirs):
     al_candidates = []
     if (wv_dir / "alignment.json").is_file():
         al_candidates.append(read_json(wv_dir / "alignment.json", {}))
-    for d in other_wv_dirs:
-        if (d / "alignment.json").is_file():
-            al_candidates.append(read_json(d / "alignment.json", {}))
+    al_candidates += [v["alignment"] for v in views if "alignment" in v]
     if al_candidates:
         best_al = max(al_candidates, key=lambda a: str(a.get("alignedAt") or ""))
         write_if_changed(wv_dir / "alignment.json", json.dumps(best_al, indent=2, sort_keys=True) + "\n")
@@ -775,9 +848,7 @@ def import_work_view(cfg, state, db_path, other_device_dirs):
     story_candidates = []
     if (wv_dir / "story.json").is_file():
         story_candidates.append(read_json(wv_dir / "story.json", {}))
-    for d in other_wv_dirs:
-        if (d / "story.json").is_file():
-            story_candidates.append(read_json(d / "story.json", {}))
+    story_candidates += [v["story"] for v in views if "story" in v]
     if story_candidates:
         best_story = dict(max(story_candidates, key=lambda s: str(s.get("writtenAt") or "")))
         seen_prefs = {}
@@ -786,19 +857,22 @@ def import_work_view(cfg, state, db_path, other_device_dirs):
                 text = p.get("preference")
                 if not text:
                     continue
-                if text not in seen_prefs:
+                if text not in seen_prefs or (p.get("timesSeen") or 0) > (seen_prefs[text].get("timesSeen") or 0):
                     seen_prefs[text] = p
-                else:
-                    if (p.get("timesSeen") or 0) > (seen_prefs[text].get("timesSeen") or 0):
-                        seen_prefs[text] = p
         resolved = resolved_rule_ids(db_path)
-        filtered = [
-            p for text, p in seen_prefs.items()
-            if pref_rule_id(text) not in resolved
-        ]
+        filtered = [p for text, p in seen_prefs.items() if pref_rule_id(text) not in resolved]
         filtered.sort(key=lambda p: (-(p.get("timesSeen") or 0), p.get("preference", "")))
         best_story["preferences"] = filtered
         write_if_changed(wv_dir / "story.json", json.dumps(best_story, indent=2, sort_keys=True) + "\n")
+
+
+def _readable(device_path):
+    """Skip a device written by a newer cm-sync: its files may mean something this version doesn't know."""
+    version = read_json(device_path / "manifest.json", {}).get("format", 1)
+    if version > FORMAT:
+        warn(f"skipping {device_path.name}: format {version} is newer than this cm-sync ({FORMAT}); update cm-sync")
+        return False
+    return True
 
 
 def import_all(cfg, state, worker, full=False):
@@ -817,17 +891,15 @@ def import_all(cfg, state, worker, full=False):
     known = set() if full else state.imported
 
     totals = {"imported": 0, "skipped": 0, "rejected": 0, "deleted": 0}
+    devices = [d for d in devices if _readable(d)]
     for d in devices:
         manifest = read_json(d / "manifest.json", {})
         name = manifest.get("device_name") or d.name
-        sessions = [(row_key("sessions", s), s) for s in read_jsonl(d / "sessions.jsonl")]
+        sessions = list(fold_jsonl(d / "sessions.jsonl", "sessions").items())
         rows = {}
         for kind in ("observations", "summaries", "prompts", "work_state"):
-            rows[kind] = []
-            for row in read_jsonl(d / f"{kind}.jsonl"):
-                key = row_key(kind, row)
-                if key not in blocked and key not in known:
-                    rows[kind].append((key, row))
+            rows[kind] = [(key, row) for key, row in fold_jsonl(d / f"{kind}.jsonl", kind).items()
+                          if key not in blocked and key not in known]
         if not any(rows.values()):
             step("Imported", f"{name}: " + paint("up to date", "dim"))
             continue
@@ -1139,8 +1211,111 @@ def run_gitleaks(path, state_dir):
     )
 
 
+# Memory notes written by Claude Code live beside claude-mem/ in the repo; sync commits them on their own
+NOTE_PATHSPEC = (":(glob)*.md", "unslop-voice", ".gitattributes")
+INDEX = "MEMORY.md"
+INDEX_LINE = re.compile(r"^- \[([^\]]*)\]\(([^)]+\.md)\)")
+NOTE_TYPES = ("user", "feedback", "project", "reference")
+
+
+def note_meta(path):
+    """name, description and type from a note's frontmatter; empty when it has none."""
+    try:
+        lines = path.read_text(encoding="utf-8").split("\n")
+    except OSError:
+        return {}
+    if not lines or lines[0].strip() != "---":
+        return {}
+    meta = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = re.match(r"\s*(name|description|type):\s*(.*)$", line)
+        if m:
+            meta[m.group(1)] = m.group(2).strip().strip("\"'")
+    return meta
+
+
+def organize_notes(cfg, write=True):
+    """Keep MEMORY.md pointing at the notes that exist. Adds a line for an unindexed note, drops one whose file is gone
+    and never rewrites a line that stays. Returns (added, dropped, problems)."""
+    index_path = cfg.repo / INDEX
+    if not index_path.is_file():
+        return [], [], []
+    text = index_path.read_text(encoding="utf-8")
+    notes = sorted(p.name for p in cfg.repo.glob("*.md") if p.name != INDEX)
+    kept, dropped, seen = [], [], {}
+    for line in text.split("\n"):
+        m = INDEX_LINE.match(line)
+        if m and "://" not in m.group(2):
+            if not (cfg.repo / m.group(2)).is_file():
+                dropped.append(m.group(2))
+                continue
+            seen[m.group(2)] = seen.get(m.group(2), 0) + 1
+        kept.append(line)
+    added = [n for n in notes if n not in seen]
+    if added or dropped:
+        while kept and not kept[-1].strip():
+            kept.pop()
+        for name in added:
+            title = name.removesuffix(".md").replace("-", " ")
+            description = note_meta(cfg.repo / name).get("description")
+            kept.append(f"- [{title[:1].upper() + title[1:]}]({name})" + (f" — {description}" if description else ""))
+        kept.append("")
+        if write:
+            write_text_atomic(index_path, "\n".join(kept))
+
+    problems = [f"{INDEX} lists {name} {n} times" for name, n in sorted(seen.items()) if n > 1]
+    for name in notes:
+        if name == "README.md":
+            continue
+        meta = note_meta(cfg.repo / name)
+        missing = [k for k in ("name", "description", "type") if not meta.get(k)]
+        if missing:
+            problems.append(f"{name}: frontmatter lacks {', '.join(missing)}")
+            continue
+        if meta["name"] != name.removesuffix(".md"):
+            problems.append(f"{name}: name is {meta['name']}, expected {name.removesuffix('.md')}")
+        if meta["type"] not in NOTE_TYPES:
+            problems.append(f"{name}: type {meta['type']} is not one of {', '.join(NOTE_TYPES)}")
+    return added, dropped, problems
+
+
+def changed_notes(cfg):
+    out = git(cfg, "ls-files", "-z", "-m", "-o", "-d", "--exclude-standard", "--", *NOTE_PATHSPEC).stdout
+    return sorted({f for f in out.split("\0") if f})
+
+
+def commit_notes(cfg, device):
+    """Commit changed notes in their own commit before the pull, so the pull has nothing of theirs to stash."""
+    require_repo(cfg)
+    require_no_conflicts(cfg)
+    added, dropped, problems = organize_notes(cfg)
+    if added or dropped:
+        step("Notes", f"index: {len(added)} added, {len(dropped)} dropped")
+    for problem in problems:
+        warn(f"note: {problem}")
+    files = changed_notes(cfg)
+    if not files:
+        return False
+    git(cfg, "add", "-A", "--", *files)
+    try:
+        for f in files:
+            if (cfg.repo / f).is_file():
+                run_gitleaks(cfg.repo / f, cfg.state_dir)
+    except CmSyncError:
+        git(cfg, "reset", "--quiet", "--", *files)
+        raise
+    status = [line.partition("\t")[0][:1] for line in git(cfg, "diff", "--cached", "--name-status", "--", *files).stdout.splitlines()]
+    message = f"memory: {device['name']} +{status.count('A')} ~{sum(s in 'MRTC' for s in status)} -{status.count('D')}"
+    git(cfg, "commit", "--quiet", "--no-verify", "-m", message, "--", *files)
+    step("Notes", message.removeprefix("memory: "))
+    return True
+
+
 def sync(cfg, state, worker, **export_args):
     device = state.require_device()
+    notes_committed = commit_notes(cfg, device)
     pull(cfg)
     import_all(cfg, state, worker)
     result = export(cfg, state, worker, **export_args)
@@ -1148,14 +1323,16 @@ def sync(cfg, state, worker, **export_args):
     rel = (DEVICES_DIR / device["id"]).as_posix()
     run_gitleaks(cfg.repo / rel, cfg.state_dir)
     git(cfg, "add", "--", rel)
-    if not git(cfg, "status", "--porcelain", "--", rel).stdout.strip():
-        step("Published", paint("nothing new", "dim"))
-        return
-    rows = sum(result["published"].values())
-    tombstones = f", {result['tombstones']} tombstones" if result["tombstones"] else ""
-    git(cfg, "commit", "--quiet", "--no-verify", "-m", f"cm-sync: {device['name']} {rows} rows{tombstones}", "--", rel)
+    committed = bool(git(cfg, "status", "--porcelain", "--", rel).stdout.strip())
+    if committed:
+        rows = sum(result["published"].values())
+        tombstones = f", {result['tombstones']} tombstones" if result["tombstones"] else ""
+        git(cfg, "commit", "--quiet", "--no-verify", "-m", f"cm-sync: {device['name']} +{rows} rows{tombstones}", "--", rel)
     if not has_upstream(cfg):
-        step("Published", "committed locally (no upstream branch to push to)")
+        step("Published", "committed locally (no upstream branch to push to)" if committed or notes_committed else paint("nothing new", "dim"))
+        return
+    if not int(git(cfg, "rev-list", "--count", "@{upstream}..HEAD").stdout.strip() or 0):
+        step("Published", paint("nothing new", "dim"))
         return
     if git(cfg, "push", "--quiet", check=False).returncode != 0:
         pull(cfg)
@@ -1310,6 +1487,12 @@ def status(cfg, state, worker):
     row("State", counted((len(state.exported), "published"), (len(state.imported), "imported"),
                          (len(state.tombstoned), "tombstones applied")))
     in_git = cfg.devices_root.is_dir() and git(cfg, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0
+    if in_git:
+        added, dropped, problems = organize_notes(cfg, write=False)
+        pending = len(changed_notes(cfg))
+        row("Notes", counted((pending, "uncommitted"), (len(added) + len(dropped), "index fixes pending"), (len(problems), "problems")))
+        for problem in problems:
+            print("  " + " " * 12 + paint(problem, "yellow"))
     if device and in_git:
         last = git(cfg, "log", "-1", "--format=%h %cr", "--", str(DEVICES_DIR / device["id"]), check=False).stdout.strip()
         sha, _, when = last.partition(" ")
