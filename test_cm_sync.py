@@ -79,6 +79,19 @@ class FakeWorker(BaseHTTPRequestHandler):
         self._reply(200, {"ok": True})
 
 
+# A second cm-sync process: takes the state dir's lock, says so, and holds it until its stdin closes
+HOLD_LOCK = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from types import SimpleNamespace
+import cm_sync
+with cm_sync.single_instance(SimpleNamespace(state_dir=Path(sys.argv[2]))):
+    print("held", flush=True)
+    sys.stdin.read()
+"""
+
+
 class Env:
     """A device: its own database, state dir and settings, sharing one repo."""
 
@@ -528,6 +541,63 @@ class CmSyncTests(unittest.TestCase):
             cm.pull(cfg)
         with self.assertRaisesRegex(cm.CmSyncError, "unmerged files"):
             cm.pull(cfg)
+
+    def test_git_retries_while_another_process_holds_the_index_lock(self):
+        repo = self.notes_repo("locked")
+        (repo / "a.md").write_text("a\n")
+        lock = repo / ".git" / "index.lock"
+        lock.write_text("")
+        timer = threading.Timer(0.3, lock.unlink)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        cm.git(SimpleNamespace(repo=repo), "add", "--", "a.md")
+        self.assertEqual(self.git(repo, "diff", "--cached", "--name-only").strip(), "a.md")
+
+    def test_git_gives_up_on_a_stale_index_lock_and_retries_no_other_failure(self):
+        repo = self.notes_repo("stale")
+        (repo / "a.md").write_text("a\n")
+        (repo / ".git" / "index.lock").write_text("")
+        cfg = SimpleNamespace(repo=repo)
+        with mock.patch.object(cm, "GIT_LOCK_RETRY_DELAYS", (0.01, 0.01)), mock.patch.object(cm.time, "sleep") as sleep:
+            with self.assertRaisesRegex(cm.CmSyncError, r"index\.lock"):
+                cm.git(cfg, "add", "--", "a.md")
+            self.assertEqual(sleep.call_count, 2)
+            sleep.reset_mock()
+            with self.assertRaises(cm.CmSyncError):
+                cm.git(cfg, "rev-parse", "--verify", "no-such-ref")
+            sleep.assert_not_called()
+
+    def test_second_cm_sync_waits_for_the_first_process_and_gives_up_after_the_wait(self):
+        cfg = self.a.cfg
+        holder = subprocess.Popen([sys.executable, "-I", "-c", HOLD_LOCK, str(Path(cm.__file__).resolve().parent), str(cfg.state_dir)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+        def stop():
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+            holder.stdin.close()
+
+        self.addCleanup(stop)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with self.assertRaisesRegex(cm.CmSyncError, "another cm-sync is still running after 0.2s"):
+            with cm.single_instance(cfg, wait=0.2):
+                self.fail("took a lock that another process holds")
+        release = threading.Timer(0.3, holder.stdin.close)
+        release.start()
+        self.addCleanup(release.cancel)
+        with cm.single_instance(cfg, wait=10):
+            self.assertEqual(holder.wait(timeout=5), 0)
+
+    def test_main_locks_only_the_commands_that_write(self):
+        argv = ["--repo", str(self.repo), "--state-dir", str(self.a.state_dir)]
+        out, err = io.StringIO(), io.StringIO()
+        with cm.single_instance(self.a.cfg), mock.patch.object(cm, "LOCK_WAIT_SECONDS", 0.1), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            for command in cm.LOCKED_COMMANDS:
+                self.assertEqual(cm.main(argv + [command, "--quiet"]), 2, command)
+            self.assertEqual(cm.main(argv + ["url"]), 0)
+        self.assertEqual(err.getvalue().count("another cm-sync is still running"), len(cm.LOCKED_COMMANDS))
 
     def test_tilde_uses_forward_slashes(self):
         self.assertEqual(cm.tilde(Path.home() / "a" / "b"), "~/a/b")

@@ -11,6 +11,7 @@ with origin_device_id / origin_local_id.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -107,6 +108,13 @@ WORK_STATE_COLUMNS = {
 # claude-mem's My Rules: rules are work-state tasks in this list; MY-RULES.md holds the "on" ones these set
 RULES_LIST = "my-rules"
 RULES_ACTIVE_BY = ("owner", "approved")
+
+# Commands that write the repo or the state dir run one at a time; two sessions' hooks often fire together
+LOCKED_COMMANDS = ("export", "import", "sync")
+LOCK_FILE = "cm-sync.lock"
+LOCK_WAIT_SECONDS = 30
+# Waits before retrying a git command that lost the race for .git/index.lock to another git process
+GIT_LOCK_RETRY_DELAYS = (0.1, 0.2, 0.4, 0.8, 1.5, 2)
 
 QUIET = False
 WINDOWS = os.name == "nt"
@@ -1109,8 +1117,48 @@ def refile(cfg, worker, session_id, project):
 # ------------------------------------------------------------------ git
 
 
+def try_lock(handle):
+    """Take an exclusive OS lock without waiting. The OS drops it when the process ends, so a crash leaves nothing stale."""
+    try:
+        if WINDOWS:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def single_instance(cfg, wait=None):
+    """Hold the state dir's lock, waiting up to `wait` seconds for another cm-sync to finish."""
+    wait = LOCK_WAIT_SECONDS if wait is None else wait
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg.state_dir / LOCK_FILE
+    with open(path, "a+") as handle:
+        deadline = time.monotonic() + wait
+        announced = False
+        while not try_lock(handle):
+            if time.monotonic() >= deadline:
+                raise CmSyncError(f"another cm-sync is still running after {wait:g}s (lock: {tilde(path)}); nothing was changed")
+            if not announced:
+                info("Waiting for another cm-sync to finish…")
+                announced = True
+            time.sleep(0.1)
+        yield
+
+
 def git(cfg, *args, check=True):
-    result = subprocess.run(["git", "-C", str(cfg.repo), *args], capture_output=True, encoding="utf-8", errors="replace")
+    command = ["git", "-C", str(cfg.repo), *args]
+    result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace")
+    for delay in GIT_LOCK_RETRY_DELAYS:
+        if result.returncode == 0 or "index.lock" not in result.stderr:
+            break
+        time.sleep(delay)
+        result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace")
     if check and result.returncode != 0:
         raise CmSyncError(f"git {' '.join(args)} failed:\n{result.stderr.strip() or result.stdout.strip()}")
     return result
@@ -1595,29 +1643,31 @@ def main(argv=None):
     args = parser.parse_args(with_default_command(sys.argv[1:] if argv is None else list(argv), set(sub.choices)))
     QUIET = getattr(args, "quiet", False)
     cfg = Config(args.repo, args.state_dir)
-    state = State(cfg)
     worker = Worker(cfg.worker_url)
     export_args = {k: getattr(args, k, False) for k in ("with_prompts", "allow_unredacted", "exclude_flagged")}
 
     try:
-        if args.command == "setup":
-            return 1 if setup(cfg, state, worker, args.yes) else 0
-        if args.command == "export":
-            export(cfg, state, worker, **export_args)
-        elif args.command == "import":
-            if not args.no_pull:
-                pull(cfg)
-            import_all(cfg, state, worker, full=args.full)
-        elif args.command == "sync":
-            sync(cfg, state, worker, **export_args)
-        elif args.command == "status":
-            status(cfg, state, worker)
-        elif args.command == "hooks":
-            hooks()
-        elif args.command == "url":
-            print(cfg.worker_url)
-        elif args.command == "refile":
-            refile(cfg, worker, args.session, args.project)
+        with single_instance(cfg) if args.command in LOCKED_COMMANDS else contextlib.nullcontext():
+            # Read under the lock: a run that waited must see the keys the earlier run saved
+            state = State(cfg)
+            if args.command == "setup":
+                return 1 if setup(cfg, state, worker, args.yes) else 0
+            if args.command == "export":
+                export(cfg, state, worker, **export_args)
+            elif args.command == "import":
+                if not args.no_pull:
+                    pull(cfg)
+                import_all(cfg, state, worker, full=args.full)
+            elif args.command == "sync":
+                sync(cfg, state, worker, **export_args)
+            elif args.command == "status":
+                status(cfg, state, worker)
+            elif args.command == "hooks":
+                hooks()
+            elif args.command == "url":
+                print(cfg.worker_url)
+            elif args.command == "refile":
+                refile(cfg, worker, args.session, args.project)
     except CmSyncError as e:
         warn(f"cm-sync: {e}", "red")
         return 2
